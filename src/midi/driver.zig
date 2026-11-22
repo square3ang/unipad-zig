@@ -464,9 +464,9 @@ test "FastLED 0x5F batching, clear, grouping, alpha, and packet splitting" {
     try std.testing.expect(!Model.launchpad_corefw_s.supportsFastLed());
     try std.testing.expect(!Model.launchpad_pro_mk3.supportsFastLed());
 
-    // Palette velocities map to Novation hardware 6-bit RGB, not UniPad's UI pastel palette
-    try std.testing.expectEqual(Rgb6{ .r = 15, .g = 15, .b = 15 }, argbToRgb6(palette.argbOf(1), 1));
-    try std.testing.expectEqual(Rgb6{ .r = 31, .g = 31, .b = 31 }, argbToRgb6(palette.argbOf(2), 2));
+    // Palette velocities map to Novation firmware 6-bit RGB (16/32/63 steps)
+    try std.testing.expectEqual(Rgb6{ .r = 16, .g = 16, .b = 16 }, argbToRgb6(palette.argbOf(1), 1));
+    try std.testing.expectEqual(Rgb6{ .r = 32, .g = 32, .b = 32 }, argbToRgb6(palette.argbOf(2), 2));
     try std.testing.expectEqual(Rgb6{ .r = 63, .g = 63, .b = 63 }, argbToRgb6(palette.argbOf(3), 3));
     try std.testing.expectEqual(Rgb6{ .r = 63, .g = 0, .b = 0 }, argbToRgb6(palette.argbOf(5), 5));
     try std.testing.expectEqual(Rgb6{ .r = 0, .g = 63, .b = 0 }, argbToRgb6(palette.argbOf(21), 21));

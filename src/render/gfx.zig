@@ -440,13 +440,52 @@ pub const Gfx = struct {
     }
 
     pub fn roundBox(g: *Gfx, x: f32, y: f32, w: f32, h: f32, radius: f32, fill: Color, stroke: Color) void {
+        g.roundBoxThick(x, y, w, h, radius, 1, fill, stroke);
+    }
+
+    pub fn roundBoxThick(g: *Gfx, x: f32, y: f32, w: f32, h: f32, radius: f32, thick: f32, fill: Color, stroke: Color) void {
         g.round(x, y, w, h, radius, stroke);
-        if (w > 2 and h > 2) g.round(x + 1, y + 1, w - 2, h - 2, @max(radius - 1, 0), fill);
+        if (w > thick * 2 and h > thick * 2) {
+            g.round(x + thick, y + thick, w - thick * 2, h - thick * 2, @max(radius - thick, 0), fill);
+        }
+    }
+
+    pub const Dir = enum { right, left, up, down };
+
+    pub fn chevron(g: *Gfx, cx: f32, cy: f32, w: f32, h: f32, thick: f32, dir: Dir, col: Color) void {
+        const hw = w * 0.5;
+        const hh = h * 0.5;
+        const pts: [6][2]f32 = switch (dir) {
+            .right => .{ .{ -hw, -hh }, .{ -hw + thick, -hh }, .{ hw, 0 }, .{ -hw + thick, hh }, .{ -hw, hh }, .{ hw - thick, 0 } },
+            .left => .{ .{ hw, -hh }, .{ hw - thick, -hh }, .{ -hw, 0 }, .{ hw - thick, hh }, .{ hw, hh }, .{ -hw + thick, 0 } },
+            .up => .{ .{ -hw, hh }, .{ -hw, hh - thick }, .{ 0, -hh }, .{ hw, hh - thick }, .{ hw, hh }, .{ 0, -hh + thick } },
+            .down => .{ .{ -hw, -hh }, .{ -hw, -hh + thick }, .{ 0, hh }, .{ hw, -hh + thick }, .{ hw, -hh }, .{ 0, hh - thick } },
+        };
+        var v: [6]Vertex = undefined;
+        for (0..6) |i| v[i] = vert(cx + pts[i][0], cy + pts[i][1], col);
+        g.batch.push(g.gpa, null, g.state, &v, &.{ 0, 1, 2, 0, 2, 5, 5, 2, 3, 5, 3, 4 });
     }
 
     pub fn diamond(g: *Gfx, cx: f32, cy: f32, rx: f32, ry: f32, col: Color) void {
         const v = [4]Vertex{ vert(cx, cy - ry, col), vert(cx + rx, cy, col), vert(cx, cy + ry, col), vert(cx - rx, cy, col) };
         g.batch.push(g.gpa, null, g.state, &v, &.{ 0, 1, 2, 0, 2, 3 });
+    }
+
+    pub fn quad(g: *Gfx, p0: [2]f32, p1: [2]f32, p2: [2]f32, p3: [2]f32, col: Color) void {
+        const v = [4]Vertex{ vert(p0[0], p0[1], col), vert(p1[0], p1[1], col), vert(p2[0], p2[1], col), vert(p3[0], p3[1], col) };
+        g.batch.push(g.gpa, null, g.state, &v, &.{ 0, 1, 2, 0, 2, 3 });
+    }
+
+    pub fn triDir(g: *Gfx, cx: f32, cy: f32, size: f32, dir: Dir, col: Color) void {
+        const s = size * 0.5;
+        const pts: [3][2]f32 = switch (dir) {
+            .up => .{ .{ -s, s * 0.7 }, .{ s, s * 0.7 }, .{ 0, -s * 0.8 } },
+            .down => .{ .{ -s, -s * 0.7 }, .{ s, -s * 0.7 }, .{ 0, s * 0.8 } },
+            .left => .{ .{ s * 0.7, -s }, .{ s * 0.7, s }, .{ -s * 0.8, 0 } },
+            .right => .{ .{ -s * 0.7, -s }, .{ -s * 0.7, s }, .{ s * 0.8, 0 } },
+        };
+        const v = [3]Vertex{ vert(cx + pts[0][0], cy + pts[0][1], col), vert(cx + pts[1][0], cy + pts[1][1], col), vert(cx + pts[2][0], cy + pts[2][1], col) };
+        g.batch.push(g.gpa, null, g.state, &v, &.{ 0, 1, 2 });
     }
 
     pub fn triDown(g: *Gfx, cx: f32, cy: f32, size: f32, up: bool, col: Color) void {

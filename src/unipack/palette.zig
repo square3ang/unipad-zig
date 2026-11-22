@@ -1,150 +1,70 @@
-//! Official UniPad 128-entry ARGB palette and Launchpad S red/green velocity map.
+//! Realistic Launchpad 128-entry RGB palette (Apollo Studio calibrated NovationPalette + perceptual LED-to-sRGB screen curve)
+//! and Launchpad S red/green velocity map.
 const std = @import("std");
 
-pub const argb: [128]u32 = .{
-    0x00000000, // 0
-    0x77fafafa, // 1
-    0xAAfafafa, // 2
-    0xFFfafafa, // 3
-    0xFFf8bbd0,
-    0xFFef5350, // 5
-    0xFFe57373,
-    0xFFef9a9a,
+/// Standard Novation Launchpad firmware 6-bit (0..63) RGB palette (16/32/63 steps; matches CoreFW & web-unipad `pallete.txt`).
+const novation_r = [128]u8{
+    0,  16, 32, 63, 63, 63, 32, 16, 63, 63, 32, 16, 63, 63, 32, 16,
+    33, 20, 10, 5,  18, 0,  0,  0,  18, 0,  0,  0,  18, 0,  0,  0,
+    18, 0,  0,  0,  18, 0,  0,  0,  18, 0,  0,  0,  11, 0,  0,  0,
+    26, 11, 6,  3,  63, 63, 32, 16, 63, 63, 32, 16, 63, 37, 29, 8,
+    0,  0,  0,  0,  0,  4,  31, 7,  63, 46, 43, 24, 3,  0,  0,  0,
+    6,  22, 43, 10, 63, 33, 28, 0,  14, 21, 13, 22, 12, 26, 52, 63,
+    63, 45, 35, 32, 14, 0,  3,  5,  5,  25, 32, 54, 53, 63, 39, 25,
+    5,  54, 31, 38, 35, 15, 28, 55, 39, 13, 6,  1,  45, 15, 44, 18,
+};
+const novation_g = [128]u8{
+    0,  16, 32, 63, 15, 0,  0,  0,  46, 15, 8,  4,  43, 63, 32, 16,
+    63, 63, 32, 16, 63, 63, 32, 16, 63, 63, 32, 16, 63, 63, 32, 16,
+    63, 63, 32, 16, 48, 41, 21, 11, 33, 21, 11, 6,  9,  0,  0,  0,
+    13, 0,  0,  0,  15, 0,  0,  0,  16, 0,  0,  0,  3,  13, 20, 13,
+    14, 18, 5,  0,  17, 0,  31, 7,  0,  63, 58, 63, 34, 63, 41, 10,
+    0,  0,  6,  4,  12, 55, 63, 63, 63, 63, 63, 34, 20, 20, 7,  0,
+    17, 41, 63, 22, 10, 18, 19, 5,  7,  14, 0,  16, 18, 47, 55, 44,
+    5,  52, 58, 37, 25, 15, 28, 63, 0,  0,  51, 16, 43, 12, 20, 5,
+};
+const novation_b = [128]u8{
+    0,  16, 32, 63, 15, 0,  0,  0,  26, 0,  0,  0,  11, 0,  0,  0,
+    12, 0,  0,  0,  18, 0,  0,  0,  23, 6,  3,  1,  22, 21, 11, 6,
+    45, 37, 18, 9,  63, 63, 32, 16, 63, 63, 32, 16, 63, 63, 32, 16,
+    62, 63, 32, 16, 63, 63, 32, 16, 27, 20, 10, 5,  0,  0,  0,  1,
+    0,  6,  27, 63, 19, 50, 31, 7,  0,  11, 1,  2,  0,  23, 63, 63,
+    63, 63, 30, 0,  0,  1,  5,  0,  9,  27, 50, 63, 48, 57, 63, 22,
+    0,  0,  0,  1,  0,  3,  8,  10, 22, 6,  0,  10, 4,  9,  11, 3,
+    11, 26, 34, 63, 63, 15, 28, 63, 0,  0,  0,  0,  0,  0,  0,  0,
+};
 
-    0xFFfff3e0,
-    0xFFffa726,
-    0xFFffb960, // 10
-    0xFFffcc80,
-    0xFFffe0b2,
-    0xFFffee58,
-    0xFFfff59d,
-    0xFFfff9c4,
+/// Per-channel perceptual LED-to-sRGB curve with frosted-silicone scatter and `#505050` ambient floor.
+/// Avoids double-multiplying brightness (`val^2`) and lifts dark linear secondary channels (orange/blue/purple/dim steps).
+fn led6ToScreenArgb(r6: u8, g6: u8, b6: u8) u32 {
+    if (r6 == 0 and g6 == 0 and b6 == 0) return 0x00000000;
+    const inv_gamma = 1.0 / 2.8;
+    const sr: f64 = if (r6 > 0) std.math.pow(f64, @as(f64, @floatFromInt(r6)) / 63.0, inv_gamma) else 0.0;
+    const sg: f64 = if (g6 > 0) std.math.pow(f64, @as(f64, @floatFromInt(g6)) / 63.0, inv_gamma) else 0.0;
+    const sb: f64 = if (b6 > 0) std.math.pow(f64, @as(f64, @floatFromInt(b6)) / 63.0, inv_gamma) else 0.0;
+    const lum = @max(sr, @max(sg, sb));
 
-    0xFFdcedc8,
-    0xFF8bc34a, // 17
-    0xFFaed581,
-    0xFFbfdf9f,
-    0xFF5ee2b0,
-    0xFF00ce3c,
-    0xFF00ba43,
-    0xFF119c3f,
+    // Frosted silicone scatter keeps whites neutral and gives blue/red/green real physical pad luminance.
+    const rr = @min(1.0, sr + 0.16 * (lum - sr));
+    const gg = @min(1.0, sg + 0.16 * (lum - sg) + 0.14 * @max(0.0, sb - @max(sr, sg)));
+    const bb = @min(1.0, sb + 0.16 * (lum - sb));
 
-    0xFF57ecc1,
-    0xFF00e864,
-    0xFF00e05c,
-    0xFF00d545,
-    0xFF7afddd,
-    0xFF00e4c5,
-    0xFF00e0b2,
-    0xFF01eec6,
+    const bg = 80.0 / 255.0;
+    const out_r: u32 = @intFromFloat(std.math.clamp(@round((rr + bg * (1.0 - lum) * (1.0 - rr)) * 255.0), 0.0, 255.0));
+    const out_g: u32 = @intFromFloat(std.math.clamp(@round((gg + bg * (1.0 - lum) * (1.0 - gg)) * 255.0), 0.0, 255.0));
+    const out_b: u32 = @intFromFloat(std.math.clamp(@round((bb + bg * (1.0 - lum) * (1.0 - bb)) * 255.0), 0.0, 255.0));
+    return 0xFF000000 | (out_r << 16) | (out_g << 8) | out_b;
+}
 
-    0xFF49efef,
-    0xFF00e7d8,
-    0xFF00e5d1,
-    0xFF01efde,
-    0xFF6addff,
-    0xFF00dafe,
-    0xFF01d6ff,
-    0xFF08acdc,
-
-    0xFF73cefe,
-    0xFF0d9bf7,
-    0xFF148de4,
-    0xFF2a77c9,
-    0xFF8693ff,
-    0xFF2196f3, // 45
-    0xFF4668f6,
-    0xFF4153dc,
-
-    0xFFb095ff,
-    0xFF8453fd,
-    0xFF634acd,
-    0xFF5749c5,
-    0xFFffb7ff,
-    0xFFe863fb,
-    0xFFd655ed,
-    0xFFd14fe9,
-
-    0xFFfc99e3,
-    0xFFe736c2,
-    0xFFe52fbe,
-    0xFFe334b6,
-    0xFFed353e,
-    0xFFffa726, // 61
-    0xFFf4df0b,
-    0xFF8bc34a, // 63
-
-    0xFF5cd100, // 64
-    0xFF00d29e,
-    0xFF2388ff,
-    0xFF3669fd,
-    0xFF00b4d0,
-    0xFF475cdc,
-    0xDDfafafa, // 70
-    0xCCfafafa, // 71
-
-    0xFFf72737,
-    0xFFd2ea7b,
-    0xFFc8df10,
-    0xFF7fe422,
-    0xFF00c931,
-    0xFF00d7a6,
-    0xFF00d8fc,
-    0xFF0b9bfc,
-
-    0xFF585cf5,
-    0xFFac59f0,
-    0xFFd980dc,
-    0xFFb8814a,
-    0xFFff9800,
-    0xFFabdf22,
-    0xFF9ee154,
-    0xFF66bb6a, // 87
-
-    0xFF3bda47,
-    0xFF6fdeb9,
-    0xFF27dbda,
-    0xFF9cc8fd,
-    0xFF79b8f7,
-    0xFFafafef,
-    0xFFd580eb,
-    0xFFf74fca,
-
-    0xFFea8a1f,
-    0xFFdbdb08,
-    0xFF9cd60d,
-    0xFFf3d335,
-    0xFFc8af41,
-    0xFF00ca69,
-    0xFF24d2b0,
-    0xFF757ebe,
-
-    0xFF5388db,
-    0xFFe5c5a6,
-    0xFFe93b3b,
-    0xFFf9a2a1,
-    0xFFed9c65,
-    0xFFe1ca72,
-    0xFFb8da78,
-    0xFF98d52c,
-
-    0xFF626cbd,
-    0xFFcac8a0,
-    0xFF90d4c2,
-    0xFFceddfe,
-    0xFFbeccf7,
-    0x55fafafa, // 117
-    0x77fafafa, // 118
-    0xAAfafafa, // 119
-
-    0xFFfe1624,
-    0xFFcd2724,
-    0xFF9ccc65, // 122
-    0xFF009c1b,
-    0xFFffff00, // 124
-    0xFFbeb212,
-    0xFFf5d01d, // 126
-    0xFFe37829,
+/// On-screen 128-entry ARGB palette computed from the hardware 6-bit Novation LED table.
+pub const argb: [128]u32 = blk: {
+    @setEvalBranchQuota(20000);
+    var out: [128]u32 = undefined;
+    out[0] = 0x00000000;
+    for (1..128) |i| {
+        out[i] = led6ToScreenArgb(novation_r[i], novation_g[i], novation_b[i]);
+    }
+    break :blk out;
 };
 
 /// Red/green code table for Launchpad S / Mini MK1 / Mini MK2.
@@ -165,38 +85,6 @@ pub const scode: [128]u8 = .{
     53, 53, 3,  19, 53, 53, 53, 53, // 104..111
     53, 53, 53, 53, 53, 53, 53, 53, // 112..119
     3,  3,  56, 56, 57, 57, 57, 57, // 120..127
-};
-
-/// Novation Launchpad RGB hardware 6-bit (0..63) palette (Pro Mk3 / X / Mini Mk3).
-const novation_r = [128]u8{
-    0,  15, 31, 63, 63, 63, 31, 15, 63, 63, 31, 15, 63, 63, 31, 15,
-    31, 19, 11, 5,  19, 0,  0,  0,  19, 0,  0,  0,  19, 0,  0,  0,
-    19, 0,  0,  0,  19, 0,  0,  0,  19, 0,  0,  0,  11, 0,  0,  0,
-    23, 11, 5,  3,  63, 63, 31, 15, 63, 63, 31, 15, 63, 39, 31, 11,
-    0,  0,  0,  0,  0,  7,  23, 7,  63, 47, 43, 23, 3,  0,  0,  0,
-    7,  23, 43, 11, 63, 31, 27, 0,  15, 23, 15, 23, 11, 27, 55, 63,
-    63, 47, 35, 31, 15, 0,  3,  5,  5,  23, 31, 55, 55, 63, 39, 27,
-    5,  55, 31, 39, 35, 15, 27, 55, 39, 13, 5,  0,  47, 15, 43, 19,
-};
-const novation_g = [128]u8{
-    0,  15, 31, 63, 15, 0,  0,  0,  47, 15, 7,  3,  43, 63, 31, 15,
-    63, 63, 31, 15, 63, 63, 31, 15, 63, 63, 31, 15, 63, 63, 31, 15,
-    63, 63, 31, 15, 47, 43, 21, 11, 31, 21, 11, 5,  7,  0,  0,  0,
-    15, 0,  0,  0,  15, 0,  0,  0,  15, 0,  0,  0,  3,  15, 19, 11,
-    15, 15, 7,  0,  15, 0,  15, 3,  0,  63, 59, 63, 31, 63, 39, 11,
-    0,  0,  7,  3,  11, 55, 63, 63, 63, 59, 63, 35, 19, 19, 7,  0,
-    19, 43, 63, 23, 11, 17, 19, 5,  7,  13, 0,  15, 17, 47, 55, 43,
-    5,  55, 59, 39, 27, 15, 27, 63, 0,  0,  51, 15, 43, 11, 19, 3,
-};
-const novation_b = [128]u8{
-    0,  15, 31, 63, 15, 0,  0,  0,  27, 0,  0,  0,  11, 0,  0,  0,
-    11, 0,  0,  0,  15, 0,  0,  0,  19, 7,  3,  1,  23, 23, 11, 5,
-    47, 39, 19, 9,  63, 63, 31, 15, 63, 63, 31, 15, 63, 63, 31, 15,
-    63, 63, 31, 15, 63, 63, 31, 15, 27, 19, 11, 7,  0,  0,  0,  0,
-    0,  7,  27, 63, 15, 47, 19, 5,  0,  11, 0,  0,  0,  23, 63, 63,
-    63, 59, 31, 0,  0,  0,  7,  0,  11, 27, 51, 63, 51, 55, 63, 23,
-    0,  0,  0,  0,  0,  3,  7,  11, 23, 5,  0,  11, 3,  7,  11, 3,
-    11, 27, 35, 63, 63, 15, 27, 63, 0,  0,  0,  0,  0,  0,  0,  0,
 };
 
 pub fn argbOf(velocity: u8) u32 {
@@ -221,11 +109,9 @@ pub fn nearestVelocity(col: u32) u8 {
     var best_idx: u8 = 3;
     var best_dist: i64 = std.math.maxInt(i64);
     for (1..128) |i| {
-        const p = argb[i];
-        const pa: i32 = @intCast((p >> 24) & 0xFF);
-        const pr: i32 = @divTrunc(@as(i32, @intCast((p >> 16) & 0xFF)) * pa, 255);
-        const pg: i32 = @divTrunc(@as(i32, @intCast((p >> 8) & 0xFF)) * pa, 255);
-        const pb: i32 = @divTrunc(@as(i32, @intCast(p & 0xFF)) * pa, 255);
+        const pr: i32 = @as(i32, novation_r[i]) * 4;
+        const pg: i32 = @as(i32, novation_g[i]) * 4;
+        const pb: i32 = @as(i32, novation_b[i]) * 4;
         const dr: i64 = r - pr;
         const dg: i64 = g - pg;
         const db: i64 = b - pb;
@@ -238,9 +124,16 @@ pub fn nearestVelocity(col: u32) u8 {
     return best_idx;
 }
 
-test "palette nearestVelocity maps primary colors sensibly" {
+test "palette maps primary colors and perceptual LED curve cleanly" {
     try std.testing.expectEqual(@as(u8, 0), nearestVelocity(0xFF000000));
     try std.testing.expectEqual(@as(u8, 3), nearestVelocity(0xFFFFFFFF));
     const red = nearestVelocity(0xFFFF0000);
     try std.testing.expect(red == 5 or red == 72 or red == 120);
+    // Neutral whites ramp cleanly and bright primaries stay vivid & luminous on screen
+    try std.testing.expectEqual(@as(u32, 0xFFA8A8A8), argbOf(1));
+    try std.testing.expectEqual(@as(u32, 0xFFCCCCCC), argbOf(2));
+    try std.testing.expectEqual(@as(u32, 0xFFFFFFFF), argbOf(3));
+    try std.testing.expectEqual(@as(u32, 0xFFFF2929), argbOf(5));
+    try std.testing.expectEqual(@as(u32, 0xFF29FF29), argbOf(21));
+    try std.testing.expectEqual(@as(u32, 0xFF294DFF), argbOf(45));
 }

@@ -814,67 +814,137 @@ pub const App = struct {
             .{ .r = 30, .g = 34, .b = 44 },
         );
 
-        // Draw Ring & Logo LEDs (when 8x8)
+        // Draw Ring & Logo LEDs (when 8x8) — Launchpad Pro Mk3 flat matte caps, backlit legends only
         if (l.show_ring) {
             const chain_count: u8 = if (a.player.pack) |pk| pk.chain_count else 8;
+            const ring_r = l.cell * 0.08;
+            const top_labels = [6][]const u8{ "Session", "Note", "Chord", "Custom", "Sequencer", "Projects" };
+            const bot_labels = [8][2][]const u8{
+                .{ "Record", "Arm" }, .{ "Mute", "" },  .{ "Solo", "" },   .{ "Volume", "" },
+                .{ "Pan", "" },       .{ "Sends", "" }, .{ "Device", "" }, .{ "Stop", "Clip" },
+            };
+            const left_labels = [4][2][]const u8{
+                .{ "Clear", "" }, .{ "Duplicate", "" }, .{ "Quantise", "" }, .{ "Fixed", "Length" },
+            };
+            const short_sz: u16 = if (l.cell >= 92) 18 else if (l.cell >= 72) 16 else if (l.cell >= 54) 14 else 12;
+            const long_sz: u16 = if (l.cell >= 104) 18 else if (l.cell >= 84) 16 else if (l.cell >= 66) 14 else 12;
+            const tri_sz = @max(l.cell * 0.25, 10.0);
+
             for (0..32) |i| {
                 const idx: u8 = @intCast(i);
                 const pos = ringCellPos(l, idx);
+                const cx = pos[0] + l.cell / 2;
+                const cy = pos[1] + l.cell / 2;
                 const led = a.player.ring_leds[idx];
                 const is_chain = idx >= 8 and (idx - 8) < chain_count;
                 const is_active_chain = is_chain and (idx - 8) == a.player.current_chain;
                 const is_guide_chain = is_chain and a.player.isGuideChain(idx - 8);
-                const lit = led.velocity != 0 or (led.color & 0x00FFFFFF) != 0 or is_guide_chain;
-                const col = if (is_guide_chain)
+                const hover = is_chain and !a.modalOpen() and g.hit(pos[0], pos[1], l.cell, l.cell);
+                const led_lit = led.velocity != 0 or (led.color & 0x00FFFFFF) != 0;
+                const lit = led_lit or is_guide_chain;
+                const cap_col: Color = if (hover) .{ .r = 34, .g = 38, .b = 50 } else .{ .r = 24, .g = 27, .b = 35 };
+                const legend_col: Color = if (is_guide_chain)
                     gfx.white
-                else if (led.velocity != 0 or (led.color & 0x00FFFFFF) != 0)
+                else if (led_lit)
                     ledColor(led.color)
+                else if (hover)
+                    .{ .r = 180, .g = 188, .b = 204 }
                 else
-                    Color{ .r = 34, .g = 38, .b = 49 };
+                    .{ .r = 112, .g = 118, .b = 132 };
+                const cap_stroke: Color = if (lit)
+                    legend_col
+                else if (hover)
+                    .{ .r = 90, .g = 100, .b = 122 }
+                else
+                    .{ .r = 56, .g = 62, .b = 76 };
 
-                if (lit) {
-                    g.additive(true);
-                    g.disc(pos[0] + l.cell / 2, pos[1] + l.cell / 2, l.cell * 0.54, col.alpha(85));
-                    g.additive(false);
-                }
+                // Opaque matte cap; LED lights both the thicker outline and the legend/text
+                g.roundBoxThick(pos[0], pos[1], l.cell, l.cell, ring_r, @max(l.cell * 0.042, 2.2), cap_col, cap_stroke);
 
-                // Recessed ring cap socket + cap body
-                const cx = pos[0] + l.cell * 0.11;
-                const cy = pos[1] + l.cell * 0.11;
-                const cw = l.cell * 0.78;
-                const cr = l.cell * 0.28;
-                g.roundBox(cx, cy, cw, cw, cr, if (lit) col else .{ .r = 25, .g = 28, .b = 37 }, if (is_guide_chain) gfx.white else if (is_active_chain) gfx.accent else .{ .r = 42, .g = 47, .b = 60 });
-
-                if (lit) {
-                    g.round(cx + cw * 0.18, cy + cw * 0.18, cw * 0.64, cw * 0.64, cr * 0.65, gfx.mix(col, gfx.white, 0.28).alpha(160));
-                }
-
-                if (is_chain) {
-                    const ch_num = idx - 8 + 1;
-                    g.fmtCentered(pos[0] + l.cell / 2, pos[1] + l.cell / 2, 12, if (lit) .{ .r = 12, .g = 14, .b = 20 } else if (is_active_chain) gfx.white else gfx.dim, "{d}", .{ch_num});
-                    if (is_guide_chain) {
-                        g.ring(pos[0] + l.cell / 2, pos[1] + l.cell / 2, l.cell * 0.45, 2.5, gfx.white);
-                    } else if (is_active_chain) {
-                        g.ring(pos[0] + l.cell / 2, pos[1] + l.cell / 2, l.cell * 0.45, 2.0, gfx.accent);
+                if (idx < 8) {
+                    if (idx == 0) {
+                        g.triDir(cx, cy, tri_sz, .left, legend_col);
+                    } else if (idx == 1) {
+                        g.triDir(cx, cy, tri_sz, .right, legend_col);
+                    } else {
+                        const lbl = top_labels[idx - 2];
+                        g.textCentered(lbl, cx, cy, if (lbl.len >= 7) long_sz else short_sz, legend_col);
                     }
-                } else if (!lit) {
-                    // Subtle center dot on non-chain function buttons
-                    g.disc(pos[0] + l.cell / 2, pos[1] + l.cell / 2, @max(l.cell * 0.06, 2.0), .{ .r = 56, .g = 62, .b = 78 });
+                } else if (idx < 16) {
+                    g.chevron(cx, cy, l.cell * 0.21, l.cell * 0.32, @max(l.cell * 0.045, 2.0), .right, legend_col);
+                } else if (idx < 24) {
+                    const pair = bot_labels[23 - idx];
+                    const sz = if (pair[0].len >= 7 or pair[1].len >= 7) long_sz else short_sz;
+                    if (pair[1].len == 0) {
+                        g.textCentered(pair[0], cx, cy, sz, legend_col);
+                    } else {
+                        const dy: f32 = @as(f32, @floatFromInt(sz)) * 0.56;
+                        g.textCentered(pair[0], cx, cy - dy, sz, legend_col);
+                        g.textCentered(pair[1], cx, cy + dy, sz, legend_col);
+                    }
+                } else {
+                    const row_idx = 31 - idx; // 0 (top) .. 7 (bottom)
+                    if (row_idx == 0) {
+                        g.triDir(cx, cy, tri_sz, .up, legend_col);
+                    } else if (row_idx == 1) {
+                        g.triDir(cx, cy, tri_sz, .down, legend_col);
+                    } else if (row_idx < 6) {
+                        const pair = left_labels[row_idx - 2];
+                        const sz = if (pair[0].len >= 7 or pair[1].len >= 7) long_sz else short_sz;
+                        if (pair[1].len == 0) {
+                            g.textCentered(pair[0], cx, cy, sz, legend_col);
+                        } else {
+                            const dy: f32 = @as(f32, @floatFromInt(sz)) * 0.56;
+                            g.textCentered(pair[0], cx, cy - dy, sz, legend_col);
+                            g.textCentered(pair[1], cx, cy + dy, sz, legend_col);
+                        }
+                    } else if (row_idx == 6) {
+                        const play_sz = @max(l.cell * 0.31, 12.0);
+                        g.triDir(cx, cy, play_sz, .right, legend_col);
+                        g.triDir(cx - play_sz * 0.04, cy, play_sz * 0.62, .right, cap_col);
+                    } else {
+                        g.ring(cx, cy, @max(l.cell * 0.16, 6.5), @max(l.cell * 0.04, 2.0), legend_col);
+                    }
+                }
+
+                // Side pointer arrow outside frame pointing inward at the active chain (Web UniPad style)
+                if (is_active_chain) {
+                    const arrow_col: Color = .{ .r = 186, .g = 194, .b = 212 };
+                    const aw = @max(l.cell * 0.16, 7.0);
+                    const ah = @max(l.cell * 0.24, 11.0);
+                    const at = @max(l.cell * 0.04, 2.0);
+                    if (idx < 16) {
+                        g.chevron(l.frame_x + l.frame_w + 13, cy, aw, ah, at, .left, arrow_col);
+                    } else if (idx < 24) {
+                        g.chevron(cx, l.frame_y + l.frame_h + 13, ah, aw, at, .up, arrow_col);
+                    } else {
+                        g.chevron(l.frame_x - 13, cy, aw, ah, at, .right, arrow_col);
+                    }
                 }
             }
 
-            // Novation-style Logo LED (top-right corner)
+            // Novation Logo indicator (top-right, flush in chassis — not a button)
             const logo_pos = ringCellPos(l, pack_mod.logo_led_index);
             const logo_led = a.player.ring_leds[pack_mod.logo_led_index];
             const logo_lit = logo_led.velocity != 0 or (logo_led.color & 0x00FFFFFF) != 0;
-            const logo_col = if (logo_lit) ledColor(logo_led.color) else Color{ .r = 52, .g = 62, .b = 84 };
-            if (logo_lit) {
-                g.additive(true);
-                g.disc(logo_pos[0] + l.cell / 2, logo_pos[1] + l.cell / 2, l.cell * 0.50, logo_col.alpha(90));
-                g.additive(false);
-            }
-            g.roundBox(logo_pos[0] + l.cell * 0.16, logo_pos[1] + l.cell * 0.16, l.cell * 0.68, l.cell * 0.68, l.cell * 0.16, .{ .r = 22, .g = 25, .b = 34 }, logo_col.alpha(160));
-            g.diamond(logo_pos[0] + l.cell / 2, logo_pos[1] + l.cell / 2, l.cell * 0.19, l.cell * 0.19, logo_col);
+            const logo_col: Color = if (logo_lit) ledColor(logo_led.color) else .{ .r = 74, .g = 78, .b = 90 };
+            const lcx = logo_pos[0] + l.cell / 2;
+            const lcy = logo_pos[1] + l.cell / 2;
+            const l_in = l.cell * 0.16;
+            const l_sz = l.cell - l_in * 2;
+            const well_dark: Color = .{ .r = 11, .g = 12, .b = 16 };
+            g.round(logo_pos[0] + l_in, logo_pos[1] + l_in, l_sz, l_sz, l_sz * 0.14, logo_col);
+            const d = l_sz * 0.42;
+            g.diamond(lcx, lcy, d, d, well_dark);
+            const sp = d * 0.62;
+            const t = @max(l_sz * 0.055, 1.8);
+            g.quad(
+                .{ lcx - sp - t, lcy + sp - t },
+                .{ lcx + sp - t, lcy - sp - t },
+                .{ lcx + sp + t, lcy - sp + t },
+                .{ lcx - sp + t, lcy + sp + t },
+                logo_col,
+            );
         }
 
         // Draw Pad Grid
@@ -893,7 +963,7 @@ pub const App = struct {
                 const led_lit = led.velocity != 0 or (led.color & 0x00FFFFFF) != 0;
                 const lit = led_lit or is_guide_now;
 
-                const idle_col: Color = .{ .r = 38, .g = 42, .b = 54 };
+                const idle_col: Color = .{ .r = 80, .g = 80, .b = 80 };
                 const guide_col = if (is_guide_now)
                     gfx.mix(idle_col, gfx.white, std.math.clamp((guide_lvl - 0.25) / 0.75, 0.25, 1.0))
                 else
@@ -903,7 +973,7 @@ pub const App = struct {
                 else if (is_guide_pad)
                     guide_col
                 else if (pressed)
-                    .{ .r = 104, .g = 114, .b = 140 }
+                    .{ .r = 120, .g = 120, .b = 128 }
                 else
                     idle_col;
 
@@ -944,7 +1014,7 @@ pub const App = struct {
                     }
                 } else {
                     // Subtle matte top sheen on unlit silicone
-                    g.rect(px + face_in + 4, py + face_in + 1, @max(face_s - 8, 2), 1.2, .{ .r = 74, .g = 82, .b = 104, .a = 90 });
+                    g.rect(px + face_in + 4, py + face_in + 1, @max(face_s - 8, 2), 1.2, .{ .r = 255, .g = 255, .b = 255, .a = 28 });
                 }
 
                 if (pressed) {
