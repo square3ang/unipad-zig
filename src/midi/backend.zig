@@ -23,6 +23,8 @@ pub const Midi = struct {
     connected_out: ?u32 = null,
     connected_name: [128]u8 = @splat(0),
     connected_name_len: usize = 0,
+    fast_led_enabled: bool = true,
+    fast_led: driver.FastLedBatch = .{},
 
     // Linux ALSA Sequencer handles
     seq: if (builtin.os.tag == .linux) ?*c.snd_seq_t else void = if (builtin.os.tag == .linux) null else {},
@@ -239,6 +241,7 @@ pub const Midi = struct {
     }
 
     pub fn disconnect(m: *Midi) void {
+        m.fast_led.reset();
         if (builtin.os.tag == .linux) {
             if (m.seq) |seq| {
                 if (m.connected_in) |id| _ = c.snd_seq_disconnect_from(seq, m.seq_port, @intCast(id >> 16), @intCast(id & 0xFFFF));
@@ -257,36 +260,64 @@ pub const Midi = struct {
     }
 
     pub fn sendInit(m: *Midi) void {
+        m.fast_led.reset();
         for (m.model.initSysEx()) |sysex| {
             m.sendBytes(sysex);
         }
         m.flush();
     }
 
-    pub fn sendPadLed(m: *Midi, row: u8, col: u8, velocity: u8) void {
+    pub fn useFastLed(m: *const Midi) bool {
+        return m.fast_led_enabled and m.model.supportsFastLed();
+    }
+
+    pub fn setFastLedEnabled(m: *Midi, enabled: bool) void {
+        if (m.fast_led_enabled == enabled) return;
+        m.fast_led.reset();
+        m.fast_led_enabled = enabled;
+    }
+
+    pub fn sendPadLed(m: *Midi, row: u8, col: u8, velocity: u8, color: u32) void {
         if (m.connected_out == null) return;
+        if (m.useFastLed()) {
+            m.fast_led.setPad(row, col, driver.argbToRgb6(color, velocity));
+            return;
+        }
         if (driver.encodePadLed(m.model, row, col, velocity)) |msg| {
             m.sendBytes(msg.slice());
         }
     }
 
-    pub fn sendRingLed(m: *Midi, idx: u8, velocity: u8) void {
+    pub fn sendRingLed(m: *Midi, idx: u8, velocity: u8, color: u32) void {
         if (m.connected_out == null) return;
+        if (m.useFastLed()) {
+            m.fast_led.setRing(idx, driver.argbToRgb6(color, velocity));
+            return;
+        }
         if (driver.encodeRingLed(m.model, idx, velocity)) |msg| {
             m.sendBytes(msg.slice());
         }
     }
 
-    pub fn sendClearLed(m: *Midi) void {
+    pub fn queueClearLed(m: *Midi) void {
         if (m.connected_out == null) return;
+        if (m.useFastLed()) {
+            m.fast_led.clear();
+            return;
+        }
         for (0..8) |r| {
             for (0..8) |col_i| {
-                m.sendPadLed(@intCast(r), @intCast(col_i), 0);
+                m.sendPadLed(@intCast(r), @intCast(col_i), 0, 0);
             }
         }
         for (0..33) |i| {
-            m.sendRingLed(@intCast(i), 0);
+            m.sendRingLed(@intCast(i), 0, 0);
         }
+    }
+
+    pub fn sendClearLed(m: *Midi) void {
+        if (m.connected_out == null) return;
+        m.queueClearLed();
         m.flush();
     }
 
@@ -320,6 +351,9 @@ pub const Midi = struct {
     }
 
     pub fn flush(m: *Midi) void {
+        if (m.connected_out != null and m.useFastLed()) {
+            m.fast_led.flush(m, sendBytes);
+        }
         if (builtin.os.tag == .linux) {
             if (m.seq) |seq| _ = c.snd_seq_drain_output(seq);
         }

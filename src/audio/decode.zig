@@ -18,6 +18,11 @@ fn lower(path: []const u8, buf: []u8) []const u8 {
 }
 
 fn decodeRaw(gpa: std.mem.Allocator, bytes: []const u8, name: []const u8) !Raw {
+    if (bytes.len >= 12 and std.mem.startsWith(u8, bytes, "FORM") and
+        (std.mem.eql(u8, bytes[8..12], "AIFF") or std.mem.eql(u8, bytes[8..12], "AIFC")))
+    {
+        if (try decodeAiff(gpa, bytes)) |raw| return raw;
+    }
     var ext_buf: [8]u8 = undefined;
     const ext = lower(std.fs.path.extension(name), &ext_buf);
     const try_order: [4]u8 = if (std.mem.eql(u8, ext, ".ogg"))
@@ -101,6 +106,79 @@ fn hermite(x0: f32, x1: f32, x2: f32, x3: f32, t: f32) f32 {
     const b = x0 - 2.5 * x1 + 2 * x2 - 0.5 * x3;
     const cc = -0.5 * x0 + 0.5 * x2;
     return ((a * t + b) * t + cc) * t + x1;
+}
+
+fn decodeAiff(gpa: std.mem.Allocator, bytes: []const u8) !?Raw {
+    var channels: u32 = 0;
+    var num_frames: u32 = 0;
+    var sample_bits: u16 = 0;
+    var rate: u32 = 0;
+    var little_endian = false;
+    var pcm: []const u8 = &.{};
+
+    var pos: usize = 12;
+    while (pos + 8 <= bytes.len) {
+        const id = bytes[pos .. pos + 4];
+        const size: usize = std.mem.readInt(u32, bytes[pos + 4 ..][0..4], .big);
+        const body_start = pos + 8;
+        if (body_start > bytes.len) break;
+        const body_end = @min(body_start + size, bytes.len);
+        const body = bytes[body_start..body_end];
+
+        if (std.mem.eql(u8, id, "COMM") and body.len >= 18) {
+            channels = std.mem.readInt(u16, body[0..2], .big);
+            num_frames = std.mem.readInt(u32, body[2..6], .big);
+            sample_bits = std.mem.readInt(u16, body[6..8], .big);
+            // Parse 80-bit IEEE 754 extended sample rate
+            const exp_raw = std.mem.readInt(u16, body[8..10], .big) & 0x7FFF;
+            const mant = std.mem.readInt(u64, body[10..18], .big);
+            if (exp_raw >= 16383 and exp_raw < 16383 + 31) {
+                const shift: u6 = @intCast(63 - (exp_raw - 16383));
+                rate = @intCast(mant >> shift);
+            }
+            if (body.len >= 22) {
+                const comp = body[18..22];
+                if (std.mem.eql(u8, comp, "sowt")) {
+                    little_endian = true;
+                } else if (!std.mem.eql(u8, comp, "NONE") and !std.mem.eql(u8, comp, "twos")) {
+                    return null;
+                }
+            }
+        } else if (std.mem.eql(u8, id, "SSND") and body.len >= 8) {
+            const off: usize = std.mem.readInt(u32, body[0..4], .big);
+            if (8 + off <= body.len) pcm = body[8 + off ..];
+        }
+        pos = body_start + size + (size & 1);
+    }
+
+    if (channels == 0 or channels > 8 or rate == 0 or num_frames == 0 or pcm.len == 0) return null;
+    const bps: usize = switch (sample_bits) {
+        8 => 1,
+        16 => 2,
+        24 => 3,
+        32 => 4,
+        else => return null,
+    };
+    const total_samples = @min(@as(usize, num_frames) * channels, pcm.len / bps);
+    if (total_samples == 0 or total_samples > max_raw_samples) return null;
+    const out = try gpa.alloc(f32, total_samples);
+    for (0..total_samples) |i| {
+        const at = pcm[i * bps ..][0..bps];
+        out[i] = switch (bps) {
+            1 => @as(f32, @floatFromInt(@as(i8, @bitCast(at[0])))) / 128.0,
+            2 => @as(f32, @floatFromInt(std.mem.readInt(i16, at[0..2], if (little_endian) .little else .big))) / 32768.0,
+            3 => blk: {
+                const raw24: i32 = if (little_endian)
+                    (@as(i32, @as(i8, @bitCast(at[2]))) << 16) | (@as(i32, at[1]) << 8) | at[0]
+                else
+                    (@as(i32, @as(i8, @bitCast(at[0]))) << 16) | (@as(i32, at[1]) << 8) | at[2];
+                break :blk @as(f32, @floatFromInt(raw24)) / 8388608.0;
+            },
+            4 => @as(f32, @floatFromInt(std.mem.readInt(i32, at[0..4], if (little_endian) .little else .big))) / 2147483648.0,
+            else => 0,
+        };
+    }
+    return .{ .samples = out, .channels = channels, .rate = rate };
 }
 
 pub fn decode(gpa: std.mem.Allocator, bytes: []const u8, name: []const u8, out_rate: u32) !Sample {

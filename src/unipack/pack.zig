@@ -4,6 +4,7 @@ const std = @import("std");
 const c = @import("c");
 const decode = @import("../audio/decode.zig");
 const palette = @import("palette.zig");
+const ableton = @import("ableton.zig");
 
 pub const max_grid = 64;
 pub const max_chains = 24;
@@ -59,6 +60,7 @@ pub const UniPack = struct {
 
     sound_count: usize = 0,
     led_count: usize = 0,
+    from_ableton: bool = false,
 
     pub fn deinit(p: *UniPack) void {
         for (p.samples) |s| if (s.data.len > 0) p.gpa.free(s.data);
@@ -84,27 +86,70 @@ pub const UniPack = struct {
     }
 };
 
-const VirtualFile = struct {
+pub const VirtualFile = struct {
     /// Forward-slash relative path within the pack root.
     rel_path: []const u8,
     bytes: []const u8,
 };
 
-/// Loads a UniPack from either a directory path or a .zip/.uni archive file.
-pub fn load(gpa: std.mem.Allocator, io: std.Io, path: []const u8, sample_rate: u32) !*UniPack {
+/// Collects all files from a directory, a .zip/.uni archive, or a direct .als file's project folder.
+pub fn collectInputFiles(ta: std.mem.Allocator, io: std.Io, path: []const u8) ![]VirtualFile {
     const stat = std.Io.Dir.cwd().statFile(io, path, .{}) catch return error.FileNotFound;
-    var tmp_arena = std.heap.ArenaAllocator.init(gpa);
-    defer tmp_arena.deinit();
-    const ta = tmp_arena.allocator();
-
     var files: std.ArrayList(VirtualFile) = .empty;
     if (stat.kind == .directory) {
         try collectDir(ta, io, path, "", &files);
+    } else if (endsWithIgnoreCase(path, ".als")) {
+        const dir = std.fs.path.dirname(path) orelse ".";
+        try collectDir(ta, io, dir, "", &files);
+        // Ableton packs often place the .als inside an "Open Here/" subfolder while samples sit in the parent folder.
+        var has_audio = false;
+        for (files.items) |f| {
+            if (endsWithIgnoreCase(f.rel_path, ".wav") or endsWithIgnoreCase(f.rel_path, ".mp3") or
+                endsWithIgnoreCase(f.rel_path, ".ogg") or endsWithIgnoreCase(f.rel_path, ".flac") or
+                endsWithIgnoreCase(f.rel_path, ".aif") or endsWithIgnoreCase(f.rel_path, ".aiff"))
+            {
+                has_audio = true;
+                break;
+            }
+        }
+        if (!has_audio) {
+            if (std.fs.path.dirname(dir)) |parent| {
+                files.clearRetainingCapacity();
+                try collectDir(ta, io, parent, "", &files);
+            }
+        }
     } else {
         try collectArchive(ta, path, &files);
     }
     stripCommonPrefix(ta, files.items);
-    return parseFiles(gpa, files.items, sample_rate);
+    return files.items;
+}
+
+/// Loads a UniPack or Ableton Live project from a directory, .zip/.uni archive, or .als file.
+pub fn load(gpa: std.mem.Allocator, io: std.Io, path: []const u8, sample_rate: u32) !*UniPack {
+    var tmp_arena = std.heap.ArenaAllocator.init(gpa);
+    defer tmp_arena.deinit();
+    const ta = tmp_arena.allocator();
+
+    const files = try collectInputFiles(ta, io, path);
+    var has_info = false;
+    for (files) |f| {
+        if (std.ascii.eqlIgnoreCase(f.rel_path, "info")) {
+            has_info = true;
+            break;
+        }
+    }
+    if (!has_info and ableton.hasAls(files)) {
+        const base = basenameOf(path);
+        const stem = if (std.mem.lastIndexOfScalar(u8, base, '.')) |dot| base[0..dot] else base;
+        return ableton.loadFromFiles(gpa, files, sample_rate, stem);
+    }
+    return parseFiles(gpa, files, sample_rate);
+}
+
+fn endsWithIgnoreCase(s: []const u8, suffix: []const u8) bool {
+    if (s.len < suffix.len) return false;
+    return std.ascii.eqlIgnoreCase(s[s.len - suffix.len ..], suffix);
 }
 
 fn collectDir(a: std.mem.Allocator, io: std.Io, base: []const u8, prefix: []const u8, out: *std.ArrayList(VirtualFile)) !void {

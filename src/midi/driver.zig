@@ -36,6 +36,11 @@ pub const Model = enum {
         };
     }
 
+    /// True when the firmware supports the Apollo FastLED RGB SysEx (`0xF0 0x5F ... 0xF7`).
+    pub fn supportsFastLed(m: Model) bool {
+        return m == .launchpad_corefw_rgb or m == .launchpad_pro_cfw;
+    }
+
     pub fn initSysEx(m: Model) []const []const u8 {
         return switch (m) {
             .launchpad_pro => &.{
@@ -269,6 +274,158 @@ fn drumRackRingNote(idx: u8) ?u8 {
     return null;
 }
 
+pub const Rgb6 = struct {
+    r: u8 = 0,
+    g: u8 = 0,
+    b: u8 = 0,
+
+    pub fn eql(a: Rgb6, b: Rgb6) bool {
+        return a.r == b.r and a.g == b.g and a.b == b.b;
+    }
+};
+
+/// Resolves LED color to 6-bit Launchpad hardware RGB (0..63).
+/// Palette events (`auto <vel>`) use the Novation hardware RGB palette, not UniPad's screen palette.
+/// Explicit custom HEX colors (`argb != palette.argbOf(vel)`) send their direct 6-bit RGB.
+pub fn argbToRgb6(argb: u32, velocity: u8) Rgb6 {
+    if (argb == 0 or argb == palette.argbOf(velocity)) {
+        const rgb = palette.novationRgb6(velocity);
+        return .{ .r = rgb[0], .g = rgb[1], .b = rgb[2] };
+    }
+    const a: u32 = (argb >> 24) & 0xFF;
+    if (a == 0) return .{};
+    const r8: u32 = (((argb >> 16) & 0xFF) * a) / 255;
+    const g8: u32 = (((argb >> 8) & 0xFF) * a) / 255;
+    const b8: u32 = ((argb & 0xFF) * a) / 255;
+    return .{
+        .r = @intCast(r8 >> 2),
+        .g = @intCast(g8 >> 2),
+        .b = @intCast(b8 >> 2),
+    };
+}
+
+pub fn fastLedPadTarget(row: u8, col: u8) ?u8 {
+    if (row >= 8 or col >= 8) return null;
+    return 10 * (8 - row) + col + 1;
+}
+
+pub fn fastLedRingTarget(idx: u8) ?u8 {
+    if (idx < 32) return pro_ring_cc[idx];
+    if (idx == 32) return 99;
+    return null;
+}
+
+/// Zero-alloc frame batcher for CoreFW / LPP CFW FastLED SysEx (`0xF0 0x5F ... 0xF7`).
+/// Deduplicates per-target writes within a frame, groups identical colors, and splits at 240B.
+pub const FastLedBatch = struct {
+    pub const max_packet_bytes: usize = 240;
+
+    dirty: [100]bool = @splat(false),
+    colors: [100]Rgb6 = @splat(.{}),
+    clear_all: bool = false,
+
+    pub fn reset(b: *FastLedBatch) void {
+        b.dirty = @splat(false);
+        b.clear_all = false;
+    }
+
+    pub fn clear(b: *FastLedBatch) void {
+        b.dirty = @splat(false);
+        b.clear_all = true;
+    }
+
+    pub fn setPad(b: *FastLedBatch, row: u8, col: u8, rgb: Rgb6) void {
+        const target = fastLedPadTarget(row, col) orelse return;
+        b.dirty[target] = true;
+        b.colors[target] = rgb;
+    }
+
+    pub fn setRing(b: *FastLedBatch, idx: u8, rgb: Rgb6) void {
+        const target = fastLedRingTarget(idx) orelse return;
+        b.dirty[target] = true;
+        b.colors[target] = rgb;
+    }
+
+    pub fn flush(b: *FastLedBatch, ctx: anytype, comptime sendFn: fn (@TypeOf(ctx), []const u8) void) void {
+        var pkt: [max_packet_bytes]u8 = undefined;
+        pkt[0] = 0xF0;
+        pkt[1] = 0x5F;
+        var pos: usize = 2;
+
+        if (b.clear_all) {
+            // 0 clears 0..98; 1..8 also clears Pro Mk3 mirrored lower row; 99 clears logo.
+            const clear_group = [_]u8{ 0, 0, 0, 10, 0, 1, 2, 3, 4, 5, 6, 7, 8, 99 };
+            @memcpy(pkt[pos .. pos + clear_group.len], &clear_group);
+            pos += clear_group.len;
+        }
+
+        var emitted: [100]bool = @splat(false);
+        var targets: [99]u8 = undefined;
+
+        for (1..100) |t| {
+            if (!b.dirty[t] or emitted[t]) continue;
+            const rgb = b.colors[t];
+            if (b.clear_all and rgb.r == 0 and rgb.g == 0 and rgb.b == 0) {
+                emitted[t] = true;
+                continue;
+            }
+
+            var count: usize = 0;
+            for (t..100) |u| {
+                if (b.dirty[u] and !emitted[u] and b.colors[u].eql(rgb)) {
+                    targets[count] = @intCast(u);
+                    count += 1;
+                    emitted[u] = true;
+                }
+            }
+
+            var off: usize = 0;
+            while (off < count) {
+                const rem = count - off;
+                const hdr_min: usize = if (rem <= 7) 3 else 4;
+                if (pos + hdr_min + 2 > max_packet_bytes) {
+                    pkt[pos] = 0xF7;
+                    sendFn(ctx, pkt[0 .. pos + 1]);
+                    pkt[0] = 0xF0;
+                    pkt[1] = 0x5F;
+                    pos = 2;
+                }
+
+                const avail = max_packet_bytes - 1 - pos;
+                const take: usize = if (rem <= 7)
+                    @min(rem, avail - 3)
+                else if (avail >= 12)
+                    @min(rem, avail - 4)
+                else
+                    @min(@as(usize, 7), avail - 3);
+
+                if (take <= 7) {
+                    const n: u8 = @intCast(take);
+                    pkt[pos] = (rgb.r & 0x3F) | (((n >> 2) & 1) << 6);
+                    pkt[pos + 1] = (rgb.g & 0x3F) | (((n >> 1) & 1) << 6);
+                    pkt[pos + 2] = (rgb.b & 0x3F) | ((n & 1) << 6);
+                    pos += 3;
+                } else {
+                    pkt[pos] = rgb.r & 0x3F;
+                    pkt[pos + 1] = rgb.g & 0x3F;
+                    pkt[pos + 2] = rgb.b & 0x3F;
+                    pkt[pos + 3] = @intCast(take);
+                    pos += 4;
+                }
+                @memcpy(pkt[pos .. pos + take], targets[off .. off + take]);
+                pos += take;
+                off += take;
+            }
+        }
+
+        if (pos > 2) {
+            pkt[pos] = 0xF7;
+            sendFn(ctx, pkt[0 .. pos + 1]);
+        }
+        b.reset();
+    }
+};
+
 fn containsIgnoreCase(hay: []const u8, needle: []const u8) bool {
     if (needle.len == 0) return true;
     if (hay.len < needle.len) return false;
@@ -299,4 +456,131 @@ test "all Launchpad models round-trip pad and chain coordinates" {
     try std.testing.expectEqual(@as(?Model, .launchpad_pro_mk3), detectModel("Launchpad Pro MK3", 0x1235, 0x0123, ""));
     try std.testing.expectEqual(@as(?Model, .launchpad_corefw_rgb), detectModel("Launchpad X", 0x1235, 0x0103, "COREFW-1234"));
     try std.testing.expectEqual(@as(?Model, .launchpad_pro_cfw), detectModel("Launchpad Open", 0x1235, 0x0051, ""));
+}
+
+test "FastLED 0x5F batching, clear, grouping, alpha, and packet splitting" {
+    try std.testing.expect(Model.launchpad_corefw_rgb.supportsFastLed());
+    try std.testing.expect(Model.launchpad_pro_cfw.supportsFastLed());
+    try std.testing.expect(!Model.launchpad_corefw_s.supportsFastLed());
+    try std.testing.expect(!Model.launchpad_pro_mk3.supportsFastLed());
+
+    // Palette velocities map to Novation hardware 6-bit RGB, not UniPad's UI pastel palette
+    try std.testing.expectEqual(Rgb6{ .r = 15, .g = 15, .b = 15 }, argbToRgb6(palette.argbOf(1), 1));
+    try std.testing.expectEqual(Rgb6{ .r = 31, .g = 31, .b = 31 }, argbToRgb6(palette.argbOf(2), 2));
+    try std.testing.expectEqual(Rgb6{ .r = 63, .g = 63, .b = 63 }, argbToRgb6(palette.argbOf(3), 3));
+    try std.testing.expectEqual(Rgb6{ .r = 63, .g = 0, .b = 0 }, argbToRgb6(palette.argbOf(5), 5));
+    try std.testing.expectEqual(Rgb6{ .r = 0, .g = 63, .b = 0 }, argbToRgb6(palette.argbOf(21), 21));
+    try std.testing.expectEqual(Rgb6{ .r = 0, .g = 0, .b = 63 }, argbToRgb6(palette.argbOf(45), 45));
+    try std.testing.expectEqual(Rgb6{ .r = 63, .g = 32, .b = 0 }, argbToRgb6(0xFFFF8000, 0));
+
+    // Reference CoreFW / LPP CFW 0x5F decoder
+    const Sink = struct {
+        leds: [109]Rgb6 = @splat(.{}),
+        packets: usize = 0,
+        max_len: usize = 0,
+        bad_bytes: usize = 0,
+
+        fn receive(self: *@This(), pkt: []const u8) void {
+            self.packets += 1;
+            self.max_len = @max(self.max_len, pkt.len);
+            if (pkt.len < 3 or pkt[0] != 0xF0 or pkt[1] != 0x5F or pkt[pkt.len - 1] != 0xF7) {
+                self.bad_bytes += 1;
+                return;
+            }
+            for (pkt[1 .. pkt.len - 1]) |byte| {
+                if (byte >= 0x80) self.bad_bytes += 1;
+            }
+            var i: usize = 2;
+            const end = pkt.len - 1;
+            while (i < end) {
+                if (i + 3 > end) break;
+                const r0 = pkt[i];
+                const g0 = pkt[i + 1];
+                const b0 = pkt[i + 2];
+                i += 3;
+                var n: usize = ((r0 & 0x40) >> 4) | ((g0 & 0x40) >> 5) | ((b0 & 0x40) >> 6);
+                if (n == 0) {
+                    if (i >= end) break;
+                    n = pkt[i];
+                    i += 1;
+                }
+                const rgb: Rgb6 = .{ .r = r0 & 0x3F, .g = g0 & 0x3F, .b = b0 & 0x3F };
+                var k: usize = 0;
+                while (k < n and i < end) : ({
+                    k += 1;
+                    i += 1;
+                }) {
+                    const target = pkt[i];
+                    if (target == 0) {
+                        for (0..99) |idx| self.leds[idx] = rgb;
+                    } else if (target <= 8) {
+                        self.leds[target] = rgb;
+                        self.leds[100 + target] = rgb;
+                    } else if (target <= 99) {
+                        self.leds[target] = rgb;
+                    }
+                }
+            }
+        }
+    };
+
+    var sink: Sink = .{};
+    sink.leds[55] = .{ .r = 10, .g = 20, .b = 30 };
+    sink.leds[99] = .{ .r = 10, .g = 20, .b = 30 };
+    sink.leds[105] = .{ .r = 10, .g = 20, .b = 30 };
+
+    // 1. Clear + grouped compact (<=7) + explicit (>=8) + dedup in a single packet
+    var batch: FastLedBatch = .{};
+    batch.clear();
+    batch.setPad(0, 0, .{ .r = 1, .g = 2, .b = 3 });
+    batch.setPad(0, 0, .{ .r = 60, .g = 10, .b = 5 }); // overrides previous write
+    batch.setRing(8, .{ .r = 60, .g = 10, .b = 5 }); // chain 0 -> target 89, grouped with pad (0,0)
+    batch.setRing(32, .{ .r = 0, .g = 63, .b = 31 }); // logo -> target 99
+    // 10 pads with identical blue -> triggers explicit count byte (>=8)
+    for (0..8) |col_i| batch.setPad(7, @intCast(col_i), .{ .r = 0, .g = 0, .b = 50 });
+    batch.setPad(6, 0, .{ .r = 0, .g = 0, .b = 50 });
+    batch.setPad(6, 1, .{ .r = 0, .g = 0, .b = 50 });
+    batch.flush(&sink, Sink.receive);
+
+    try std.testing.expectEqual(@as(usize, 0), sink.bad_bytes);
+    try std.testing.expectEqual(@as(usize, 1), sink.packets);
+    try std.testing.expect(sink.max_len <= FastLedBatch.max_packet_bytes);
+    try std.testing.expectEqual(Rgb6{}, sink.leds[55]);
+    try std.testing.expectEqual(Rgb6{}, sink.leds[105]);
+    try std.testing.expectEqual(Rgb6{ .r = 60, .g = 10, .b = 5 }, sink.leds[81]);
+    try std.testing.expectEqual(Rgb6{ .r = 60, .g = 10, .b = 5 }, sink.leds[89]);
+    try std.testing.expectEqual(Rgb6{ .r = 0, .g = 63, .b = 31 }, sink.leds[99]);
+    for (11..19) |t| try std.testing.expectEqual(Rgb6{ .r = 0, .g = 0, .b = 50 }, sink.leds[t]);
+    try std.testing.expectEqual(Rgb6{ .r = 0, .g = 0, .b = 50 }, sink.leds[21]);
+    try std.testing.expectEqual(Rgb6{ .r = 0, .g = 0, .b = 50 }, sink.leds[22]);
+
+    // 2. Worst-case 97 unique colors splits cleanly across multiple <=240B packets
+    sink = .{};
+    for (0..8) |r| {
+        for (0..8) |c_i| {
+            const k: u8 = @intCast(r * 8 + c_i + 1);
+            batch.setPad(@intCast(r), @intCast(c_i), .{ .r = k & 63, .g = (k *% 3) & 63, .b = (k *% 7) & 63 });
+        }
+    }
+    for (0..33) |i| {
+        const k: u8 = @intCast(i + 1);
+        batch.setRing(@intCast(i), .{ .r = 63 - k, .g = k, .b = (k *% 2) & 63 });
+    }
+    batch.flush(&sink, Sink.receive);
+
+    try std.testing.expectEqual(@as(usize, 0), sink.bad_bytes);
+    try std.testing.expect(sink.packets >= 2);
+    try std.testing.expect(sink.max_len <= FastLedBatch.max_packet_bytes);
+    for (0..8) |r| {
+        for (0..8) |c_i| {
+            const k: u8 = @intCast(r * 8 + c_i + 1);
+            const t = fastLedPadTarget(@intCast(r), @intCast(c_i)).?;
+            try std.testing.expectEqual(Rgb6{ .r = k & 63, .g = (k *% 3) & 63, .b = (k *% 7) & 63 }, sink.leds[t]);
+        }
+    }
+    for (0..33) |i| {
+        const k: u8 = @intCast(i + 1);
+        const t = fastLedRingTarget(@intCast(i)).?;
+        try std.testing.expectEqual(Rgb6{ .r = 63 - k, .g = k, .b = (k *% 2) & 63 }, sink.leds[t]);
+    }
 }

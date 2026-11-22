@@ -14,6 +14,7 @@ pub const Config = struct {
     midi_model: midi_driver.Model = .launchpad_pro_mk3,
     midi_port: [256]u8 = @splat(0),
     midi_port_len: usize = 0,
+    midi_fast_led: bool = true,
 
     led_enabled: bool = true,
     show_chain: bool = true,
@@ -75,6 +76,7 @@ pub fn format(buf: []u8, cfg: *const Config) ![]const u8 {
         \\midi_auto={}
         \\midi_model={s}
         \\midi_port={s}
+        \\midi_fast_led={}
         \\led_enabled={}
         \\show_chain={}
         \\guide_mode={}
@@ -89,6 +91,7 @@ pub fn format(buf: []u8, cfg: *const Config) ![]const u8 {
             cfg.midi_auto,
             @tagName(cfg.midi_model),
             cfg.midiPortSlice(),
+            cfg.midi_fast_led,
             cfg.led_enabled,
             cfg.show_chain,
             cfg.guide_mode,
@@ -120,6 +123,8 @@ pub fn parse(txt: []const u8) Config {
             if (std.meta.stringToEnum(midi_driver.Model, val)) |m| cfg.midi_model = m;
         } else if (std.mem.eql(u8, key, "midi_port")) {
             cfg.setMidiPort(val);
+        } else if (std.mem.eql(u8, key, "midi_fast_led")) {
+            cfg.midi_fast_led = std.mem.eql(u8, val, "true");
         } else if (std.mem.eql(u8, key, "led_enabled")) {
             cfg.led_enabled = std.mem.eql(u8, val, "true");
         } else if (std.mem.eql(u8, key, "show_chain")) {
@@ -139,6 +144,7 @@ test "config format and parse round-trip all settings" {
         .volume = 0.75,
         .midi_auto = false,
         .midi_model = .launchpad_x,
+        .midi_fast_led = false,
         .led_enabled = false,
         .show_chain = false,
         .guide_mode = true,
@@ -157,6 +163,7 @@ test "config format and parse round-trip all settings" {
     try std.testing.expect(!dst.midi_auto);
     try std.testing.expectEqual(midi_driver.Model.launchpad_x, dst.midi_model);
     try std.testing.expectEqualStrings("Launchpad X: Launchpad X LPX MIDI", dst.midiPortSlice());
+    try std.testing.expect(!dst.midi_fast_led);
     try std.testing.expect(!dst.led_enabled);
     try std.testing.expect(!dst.show_chain);
     try std.testing.expect(dst.guide_mode);

@@ -17,8 +17,8 @@ pub const LedCell = struct {
 };
 
 pub const LedOutEvent = union(enum) {
-    pad: struct { row: u8, col: u8, velocity: u8 },
-    ring: struct { idx: u8, velocity: u8 }, // 0..31 round, 32 logo
+    pad: struct { row: u8, col: u8, velocity: u8, color: u32 = 0 },
+    ring: struct { idx: u8, velocity: u8, color: u32 = 0 }, // 0..31 round, 32 logo
     clear,
 };
 
@@ -40,7 +40,17 @@ const PendingWormhole = struct {
     due_ms: f64,
 };
 
+const PracticeStep = struct {
+    time_ms: f64,
+    kind: enum(u8) { pad, chain },
+    row: u8 = 0,
+    col: u8 = 0,
+    chain: u8 = 0,
+    done: bool = false,
+};
+
 const step_group_threshold_ms: u32 = 50;
+const practice_lead_ms: f64 = 1000.0;
 
 pub const Player = struct {
     gpa: std.mem.Allocator,
@@ -65,16 +75,23 @@ pub const Player = struct {
     wormholes: std.ArrayList(PendingWormhole) = .empty,
     out_events: std.ArrayList(LedOutEvent) = .empty,
 
-    // AutoPlay & simultaneous-chord Guide state
+    // AutoPlay, Practice Mode & simultaneous-chord Guide state
     auto_playing: bool = false,
     auto_idx: usize = 0,
     auto_next_ms: f64 = 0,
+    practice_playing: bool = false,
+    practice_song_ms: f64 = 0,
+    practice_last_ms: f64 = 0,
+    practice_cursor: usize = 0,
+    practice_paused_chain: ?u8 = null,
+    practice_steps: std.ArrayList(PracticeStep) = .empty,
+    practice_pad_level: [pack_mod.max_grid * pack_mod.max_grid]f32 = @splat(0),
     guide_idx: usize = 0,
     guide_expected_chain: u8 = 0,
     guide_pads: [pack_mod.max_grid * pack_mod.max_grid]bool = @splat(false),
     guide_pending: usize = 0,
     guide_chain: ?u8 = null,
-    prev_guide_pads: [pack_mod.max_grid * pack_mod.max_grid]bool = @splat(false),
+    prev_guide_pads: [pack_mod.max_grid * pack_mod.max_grid]u8 = @splat(0),
     prev_guide_chain: ?u8 = null,
 
     pub fn init(gpa: std.mem.Allocator, engine: *engine_mod.Engine) Player {
@@ -86,10 +103,12 @@ pub const Player = struct {
         p.anims.deinit(p.gpa);
         p.wormholes.deinit(p.gpa);
         p.out_events.deinit(p.gpa);
+        p.practice_steps.deinit(p.gpa);
     }
 
     pub fn unload(p: *Player) void {
         p.stopAutoPlay();
+        p.stopPractice();
         p.engine.setSamples(&.{});
         if (p.pack) |pk| {
             pk.deinit();
@@ -133,7 +152,33 @@ pub const Player = struct {
             p.clearChainIndicator(prev);
         }
         p.refreshChainLed();
-        if (p.guide_mode and !p.auto_playing) {
+        if (p.practice_playing) {
+            if (p.practice_paused_chain) |target_ch| {
+                if (target_ch == clamped) {
+                    while (p.practice_cursor < p.practice_steps.items.len) {
+                        const st = &p.practice_steps.items[p.practice_cursor];
+                        if (st.done) {
+                            p.practice_cursor += 1;
+                            continue;
+                        }
+                        if (st.kind == .chain and st.chain == clamped) {
+                            st.done = true;
+                            p.practice_cursor += 1;
+                            continue;
+                        }
+                        break;
+                    }
+                    p.practice_paused_chain = null;
+                    // Pause at the first pad of the new chain (full bright) so user starts at their own pace.
+                    if (p.practice_cursor < p.practice_steps.items.len) {
+                        p.practice_song_ms = p.practice_steps.items[p.practice_cursor].time_ms;
+                    }
+                    p.advancePracticeState();
+                    p.updatePracticeGuides();
+                    p.syncGuideLeds();
+                }
+            }
+        } else if (p.guide_mode and !p.auto_playing) {
             if (p.guide_chain) |gc| {
                 if (gc == clamped) {
                     p.guide_chain = null;
@@ -169,7 +214,7 @@ pub const Player = struct {
         p.anims.clearRetainingCapacity();
         @memset(&p.pad_leds, .{});
         @memset(&p.ring_leds, .{});
-        @memset(&p.prev_guide_pads, false);
+        @memset(&p.prev_guide_pads, 0);
         p.prev_guide_chain = null;
         p.out_events.append(p.gpa, .clear) catch {};
         p.refreshChainLed();
@@ -212,8 +257,10 @@ pub const Player = struct {
             }
         }
 
-        // 2. Advance simultaneous-chord Guide Mode when user plays any pending pad in the chord
-        if (p.guide_mode and !p.auto_playing) {
+        // 2. Advance Practice Mode or simultaneous-chord Guide Mode when user plays a pending pad
+        if (p.practice_playing and p.practice_paused_chain == null) {
+            p.consumePracticePad(row, col, now_ms);
+        } else if (p.guide_mode and !p.auto_playing) {
             if (p.guide_pads[idx]) {
                 p.guide_pads[idx] = false;
                 p.guide_pending -|= 1;
@@ -246,7 +293,12 @@ pub const Player = struct {
                 }
             }
         }
-        if (p.guide_mode) p.syncGuideLeds();
+        if (p.practice_playing) {
+            p.updatePracticeGuides();
+            p.syncGuideLeds();
+        } else if (p.guide_mode) {
+            p.syncGuideLeds();
+        }
     }
 
     pub fn releasePad(p: *Player, row: u8, col: u8) void {
@@ -266,6 +318,7 @@ pub const Player = struct {
     pub fn startAutoPlay(p: *Player, now_ms: f64) void {
         const pk = p.pack orelse return;
         if (pk.auto_play.len == 0) return;
+        p.stopPractice();
         p.stopAllSounds();
         p.clearLeds();
         p.setChain(0);
@@ -284,6 +337,218 @@ pub const Player = struct {
                 const r: u8 = @intCast(i / pack_mod.max_grid);
                 const c_idx: u8 = @intCast(i % pack_mod.max_grid);
                 p.shutdownMatchingAnims(r, c_idx, 0, false);
+            }
+        }
+    }
+
+    pub fn startPractice(p: *Player, now_ms: f64) void {
+        const pk = p.pack orelse return;
+        if (pk.auto_play.len == 0) return;
+        p.stopAutoPlay();
+        p.stopAllSounds();
+        p.clearLeds();
+        p.setChain(0);
+
+        p.practice_steps.clearRetainingCapacity();
+        var t_ms: f64 = 0;
+        var cur_ch: u8 = 0;
+        for (pk.auto_play) |ev| {
+            switch (ev) {
+                .on => |o| p.practice_steps.append(p.gpa, .{
+                    .time_ms = t_ms,
+                    .kind = .pad,
+                    .row = o.row,
+                    .col = o.col,
+                    .chain = cur_ch,
+                }) catch {},
+                .chain => |ch| {
+                    cur_ch = ch;
+                    p.practice_steps.append(p.gpa, .{
+                        .time_ms = t_ms,
+                        .kind = .chain,
+                        .chain = ch,
+                    }) catch {};
+                },
+                .delay => |ms| t_ms += @floatFromInt(ms),
+                .off => {},
+            }
+        }
+        if (p.practice_steps.items.len == 0) return;
+
+        p.practice_playing = true;
+        p.practice_cursor = 0;
+        p.practice_paused_chain = null;
+        // Start ready on the first step (like Guide Mode), then pace upcoming pads from each press.
+        p.practice_song_ms = p.practice_steps.items[0].time_ms;
+        p.practice_last_ms = now_ms;
+        @memset(&p.practice_pad_level, 0);
+        p.advancePracticeState();
+        p.updatePracticeGuides();
+        p.syncGuideLeds();
+    }
+
+    pub fn stopPractice(p: *Player) void {
+        if (!p.practice_playing) return;
+        p.practice_playing = false;
+        p.practice_paused_chain = null;
+        @memset(&p.practice_pad_level, 0);
+        p.syncGuideLeds();
+    }
+
+    pub fn practiceProgress(p: *const Player) f32 {
+        if (p.practice_steps.items.len == 0) return 0;
+        return @as(f32, @floatFromInt(p.practice_cursor)) / @as(f32, @floatFromInt(p.practice_steps.items.len));
+    }
+
+    /// Returns end index (exclusive) of the simultaneous chord starting at `start_idx`.
+    fn practiceChordEndFrom(p: *const Player, start_idx: usize) usize {
+        if (start_idx >= p.practice_steps.items.len) return start_idx;
+        const first = p.practice_steps.items[start_idx];
+        if (first.kind != .pad) return start_idx;
+        var seen: [pack_mod.max_grid * pack_mod.max_grid]bool = @splat(false);
+        var i = start_idx;
+        while (i < p.practice_steps.items.len) : (i += 1) {
+            const st = p.practice_steps.items[i];
+            if (st.done) continue;
+            if (st.kind == .chain) {
+                if (st.chain != p.current_chain) break;
+                continue;
+            }
+            if (st.time_ms - first.time_ms >= @as(f64, @floatFromInt(step_group_threshold_ms))) break;
+            const pidx = @as(usize, st.row) * pack_mod.max_grid + st.col;
+            if (seen[pidx]) break;
+            seen[pidx] = true;
+        }
+        return i;
+    }
+
+    fn currentPracticeChordEnd(p: *const Player) usize {
+        return p.practiceChordEndFrom(p.practice_cursor);
+    }
+
+    /// Advances practice_cursor past done steps and pauses automatically on a chain transition.
+    fn advancePracticeState(p: *Player) void {
+        while (p.practice_cursor < p.practice_steps.items.len) {
+            const st = &p.practice_steps.items[p.practice_cursor];
+            if (st.done) {
+                p.practice_cursor += 1;
+                continue;
+            }
+            if (st.kind == .chain) {
+                if (st.chain == p.current_chain) {
+                    st.done = true;
+                    p.practice_cursor += 1;
+                    continue;
+                }
+                p.practice_paused_chain = st.chain;
+                return;
+            }
+            break;
+        }
+        if (p.practice_cursor >= p.practice_steps.items.len) {
+            p.practice_playing = false;
+            p.practice_paused_chain = null;
+            @memset(&p.practice_pad_level, 0);
+        }
+    }
+
+    fn consumePracticePad(p: *Player, row: u8, col: u8, now_ms: f64) void {
+        const chord_end = p.currentPracticeChordEnd();
+        var matched = false;
+        var chord_time: f64 = p.practice_song_ms;
+        var i = p.practice_cursor;
+        while (i < chord_end) : (i += 1) {
+            const st = &p.practice_steps.items[i];
+            if (st.done or st.kind != .pad) continue;
+            if (st.row == row and st.col == col) {
+                st.done = true;
+                chord_time = st.time_ms;
+                matched = true;
+                break;
+            }
+        }
+        if (!matched) return;
+
+        // Check if any pads remain in this chord
+        var remaining = false;
+        var j = p.practice_cursor;
+        while (j < chord_end) : (j += 1) {
+            const st = p.practice_steps.items[j];
+            if (!st.done and st.kind == .pad) {
+                remaining = true;
+                break;
+            }
+        }
+        if (!remaining) {
+            // Anchor virtual clock to the completed chord so upcoming pads ramp in real-time from now_ms.
+            p.practice_song_ms = chord_time;
+            p.practice_last_ms = now_ms;
+            p.advancePracticeState();
+        }
+    }
+
+    fn tickPractice(p: *Player, now_ms: f64) void {
+        if (!p.practice_playing) return;
+        const dt = @max(0.0, now_ms - p.practice_last_ms);
+        p.practice_last_ms = now_ms;
+
+        p.advancePracticeState();
+        if (!p.practice_playing) return;
+
+        if (p.practice_paused_chain == null and p.practice_cursor < p.practice_steps.items.len) {
+            const cur_target_ms = p.practice_steps.items[p.practice_cursor].time_ms;
+            const speed: f64 = @floatCast(@max(p.speed_multiplier, 0.1));
+            // Advance toward the current chord's target time, then wait there (never skip unpressed pads).
+            p.practice_song_ms = @min(cur_target_ms, p.practice_song_ms + dt * speed);
+        }
+        p.updatePracticeGuides();
+    }
+
+    fn updatePracticeGuides(p: *Player) void {
+        @memset(&p.practice_pad_level, 0);
+        if (!p.practice_playing or p.practice_paused_chain != null) return;
+
+        const ramp_ms: f64 = 180.0;
+        const chord_end = p.currentPracticeChordEnd();
+
+        // 1. Current chord (press NOW -> 1.0 full white; approaching within 180ms -> ramp 0.35..1.0; earlier -> 0.20 preview)
+        var i = p.practice_cursor;
+        while (i < chord_end) : (i += 1) {
+            const st = p.practice_steps.items[i];
+            if (st.done or st.kind != .pad) continue;
+            const rem = st.time_ms - p.practice_song_ms;
+            const prog: f32 = if (rem <= 0.0)
+                1.0
+            else if (rem <= ramp_ms)
+                @floatCast(0.35 + 0.65 * (1.0 - rem / ramp_ms))
+            else
+                0.20;
+            const pidx = @as(usize, st.row) * pack_mod.max_grid + st.col;
+            if (prog > p.practice_pad_level[pidx]) p.practice_pad_level[pidx] = prog;
+        }
+
+        // 2. Preview ONLY the single next chord (within practice_lead_ms, before any chain switch) as dim preview (0.10)
+        var next_start = chord_end;
+        while (next_start < p.practice_steps.items.len) : (next_start += 1) {
+            const st = p.practice_steps.items[next_start];
+            if (st.done) continue;
+            if (st.kind == .chain) {
+                if (st.chain != p.current_chain) return;
+                continue;
+            }
+            break;
+        }
+        if (next_start < p.practice_steps.items.len) {
+            const next_st = p.practice_steps.items[next_start];
+            if (next_st.time_ms - p.practice_song_ms <= practice_lead_ms) {
+                const next_end = p.practiceChordEndFrom(next_start);
+                var k = next_start;
+                while (k < next_end) : (k += 1) {
+                    const st = p.practice_steps.items[k];
+                    if (st.done or st.kind != .pad) continue;
+                    const pidx = @as(usize, st.row) * pack_mod.max_grid + st.col;
+                    if (p.practice_pad_level[pidx] < 0.10) p.practice_pad_level[pidx] = 0.10;
+                }
             }
         }
     }
@@ -307,7 +572,7 @@ pub const Player = struct {
             }
         }
 
-        // 2. Step AutoPlay
+        // 2. Step AutoPlay or Practice Mode
         if (p.auto_playing) {
             if (p.pack) |pk| {
                 const speed: f64 = @floatCast(@max(p.speed_multiplier, 0.1));
@@ -326,11 +591,15 @@ pub const Player = struct {
                     p.auto_playing = false;
                 }
             }
+        } else if (p.practice_playing) {
+            p.tickPractice(now_ms);
         }
 
         // 3. Advance LED animations
         p.tickAnims(now_ms);
-        if (p.guide_mode) {
+        if (p.practice_playing) {
+            p.syncGuideLeds();
+        } else if (p.guide_mode) {
             if (p.auto_playing) p.previewAutoGuideChord();
             p.syncGuideLeds();
         }
@@ -425,7 +694,7 @@ pub const Player = struct {
             .owner_chain = ochain,
             .owned = true,
         };
-        p.out_events.append(p.gpa, .{ .pad = .{ .row = row, .col = col, .velocity = velocity } }) catch {};
+        p.out_events.append(p.gpa, .{ .pad = .{ .row = row, .col = col, .velocity = velocity, .color = color } }) catch {};
     }
 
     fn clearPadLedIfOwned(p: *Player, row: u8, col: u8, orow: u8, ocol: u8, ochain: u8) void {
@@ -434,8 +703,8 @@ pub const Player = struct {
         if (!cell.owned) return;
         if (cell.owner_pad_row == orow and cell.owner_pad_col == ocol and cell.owner_chain == ochain) {
             cell.* = .{};
-            const keep_white = p.isGuidePad(row, col);
-            p.out_events.append(p.gpa, .{ .pad = .{ .row = row, .col = col, .velocity = if (keep_white) 3 else 0 } }) catch {};
+            const gvel = p.guidePadVelocity(row, col);
+            p.out_events.append(p.gpa, .{ .pad = .{ .row = row, .col = col, .velocity = gvel, .color = palette.argbOf(gvel) } }) catch {};
         }
     }
 
@@ -449,7 +718,7 @@ pub const Player = struct {
             .owner_chain = ochain,
             .owned = true,
         };
-        p.out_events.append(p.gpa, .{ .ring = .{ .idx = idx, .velocity = velocity } }) catch {};
+        p.out_events.append(p.gpa, .{ .ring = .{ .idx = idx, .velocity = velocity, .color = color } }) catch {};
     }
 
     fn clearRingLedIfOwned(p: *Player, idx: u8, orow: u8, ocol: u8, ochain: u8) void {
@@ -458,7 +727,7 @@ pub const Player = struct {
         if (!cell.owned) return;
         if (cell.owner_pad_row == orow and cell.owner_pad_col == ocol and cell.owner_chain == ochain) {
             cell.* = .{};
-            p.out_events.append(p.gpa, .{ .ring = .{ .idx = idx, .velocity = 0 } }) catch {};
+            p.out_events.append(p.gpa, .{ .ring = .{ .idx = idx, .velocity = 0, .color = 0 } }) catch {};
             if (p.show_chain and idx == p.current_chain + 8) p.refreshChainLed();
         }
     }
@@ -468,7 +737,7 @@ pub const Player = struct {
         if (idx >= pack_mod.round_led_count) return;
         if (!p.ring_leds[idx].owned) {
             p.ring_leds[idx] = .{};
-            p.out_events.append(p.gpa, .{ .ring = .{ .idx = idx, .velocity = 0 } }) catch {};
+            p.out_events.append(p.gpa, .{ .ring = .{ .idx = idx, .velocity = 0, .color = 0 } }) catch {};
         }
     }
 
@@ -478,7 +747,7 @@ pub const Player = struct {
         if (idx >= pack_mod.round_led_count) return;
         if (!p.ring_leds[idx].owned) {
             p.ring_leds[idx] = .{ .color = palette.argbOf(3), .velocity = 3, .owned = false };
-            p.out_events.append(p.gpa, .{ .ring = .{ .idx = idx, .velocity = 3 } }) catch {};
+            p.out_events.append(p.gpa, .{ .ring = .{ .idx = idx, .velocity = 3, .color = palette.argbOf(3) } }) catch {};
         }
     }
 
@@ -489,18 +758,18 @@ pub const Player = struct {
         for (0..pk.button_x) |r| {
             for (0..pk.button_y) |c_idx| {
                 const cell = p.pad_leds[r * pack_mod.max_grid + c_idx];
-                if (cell.velocity != 0) {
-                    p.out_events.append(p.gpa, .{ .pad = .{ .row = @intCast(r), .col = @intCast(c_idx), .velocity = cell.velocity } }) catch {};
+                if (cell.velocity != 0 or cell.color != 0) {
+                    p.out_events.append(p.gpa, .{ .pad = .{ .row = @intCast(r), .col = @intCast(c_idx), .velocity = cell.velocity, .color = cell.color } }) catch {};
                 }
             }
         }
         for (0..pack_mod.logo_led_index + 1) |i| {
             const cell = p.ring_leds[i];
-            if (cell.velocity != 0) {
-                p.out_events.append(p.gpa, .{ .ring = .{ .idx = @intCast(i), .velocity = cell.velocity } }) catch {};
+            if (cell.velocity != 0 or cell.color != 0) {
+                p.out_events.append(p.gpa, .{ .ring = .{ .idx = @intCast(i), .velocity = cell.velocity, .color = cell.color } }) catch {};
             }
         }
-        @memset(&p.prev_guide_pads, false);
+        @memset(&p.prev_guide_pads, 0);
         p.prev_guide_chain = null;
         p.syncGuideLeds();
     }
@@ -514,11 +783,27 @@ pub const Player = struct {
     }
 
     pub fn isGuidePad(p: *const Player, row: u8, col: u8) bool {
-        if (!p.guide_mode) return false;
-        return p.guide_pads[@as(usize, row) * pack_mod.max_grid + col];
+        return p.guidePadLevel(row, col) > 0.0;
+    }
+
+    pub fn guidePadLevel(p: *const Player, row: u8, col: u8) f32 {
+        const idx = @as(usize, row) * pack_mod.max_grid + col;
+        if (p.practice_playing) return p.practice_pad_level[idx];
+        if (p.guide_mode and p.guide_pads[idx]) return 1.0;
+        return 0.0;
+    }
+
+    pub fn guidePadVelocity(p: *const Player, row: u8, col: u8) u8 {
+        const lvl = p.guidePadLevel(row, col);
+        if (lvl <= 0.0) return 0;
+        if (lvl < 0.30) return 47; // dim dark blue (next preview — clearly distinct from bright white)
+        if (lvl < 0.60) return 1; // dim white (ramping up)
+        if (lvl < 0.85) return 2; // medium white
+        return 3; // full bright white (press NOW)
     }
 
     pub fn isGuideChain(p: *const Player, chain: u8) bool {
+        if (p.practice_playing) return p.practice_paused_chain != null and p.practice_paused_chain.? == chain;
         if (!p.guide_mode) return false;
         return p.guide_chain != null and p.guide_chain.? == chain;
     }
@@ -630,32 +915,38 @@ pub const Player = struct {
         }
     }
 
-    /// Diffs current vs previous guide targets and emits hardware MIDI white LEDs (velocity 3).
+    /// Diffs current vs previous guide targets and emits hardware MIDI guide LEDs (gradual white 117->1->2->3).
     pub fn syncGuideLeds(p: *Player) void {
         const pk = p.pack orelse return;
         for (0..pk.button_x) |r| {
             for (0..pk.button_y) |col_i| {
                 const idx = r * pack_mod.max_grid + col_i;
-                const want = p.guide_mode and p.guide_pads[idx];
-                if (want == p.prev_guide_pads[idx]) continue;
-                p.prev_guide_pads[idx] = want;
-                const vel: u8 = if (want) 3 else p.pad_leds[idx].velocity;
-                p.out_events.append(p.gpa, .{ .pad = .{ .row = @intCast(r), .col = @intCast(col_i), .velocity = vel } }) catch {};
+                const want_vel = p.guidePadVelocity(@intCast(r), @intCast(col_i));
+                if (want_vel == p.prev_guide_pads[idx]) continue;
+                p.prev_guide_pads[idx] = want_vel;
+                const vel: u8 = if (want_vel != 0) want_vel else p.pad_leds[idx].velocity;
+                const col_argb: u32 = if (want_vel != 0) palette.argbOf(want_vel) else p.pad_leds[idx].color;
+                p.out_events.append(p.gpa, .{ .pad = .{ .row = @intCast(r), .col = @intCast(col_i), .velocity = vel, .color = col_argb } }) catch {};
             }
         }
 
-        const want_chain: ?u8 = if (p.guide_mode) p.guide_chain else null;
+        const want_chain: ?u8 = if (p.practice_playing)
+            p.practice_paused_chain
+        else if (p.guide_mode)
+            p.guide_chain
+        else
+            null;
         if (want_chain != p.prev_guide_chain) {
             if (p.prev_guide_chain) |old_ch| {
                 const ridx = old_ch + 8;
                 if (ridx < pack_mod.round_led_count) {
-                    p.out_events.append(p.gpa, .{ .ring = .{ .idx = ridx, .velocity = p.ring_leds[ridx].velocity } }) catch {};
+                    p.out_events.append(p.gpa, .{ .ring = .{ .idx = ridx, .velocity = p.ring_leds[ridx].velocity, .color = p.ring_leds[ridx].color } }) catch {};
                 }
             }
             if (want_chain) |new_ch| {
                 const ridx = new_ch + 8;
                 if (ridx < pack_mod.round_led_count) {
-                    p.out_events.append(p.gpa, .{ .ring = .{ .idx = ridx, .velocity = 3 } }) catch {};
+                    p.out_events.append(p.gpa, .{ .ring = .{ .idx = ridx, .velocity = 3, .color = palette.argbOf(3) } }) catch {};
                 }
             }
             p.prev_guide_chain = want_chain;
@@ -736,4 +1027,43 @@ test "player runs LED animations, ownership off, held loops, and autoplay" {
     player.setChain(1);
     try std.testing.expect(!player.isGuideChain(1));
     try std.testing.expect(player.isGuidePad(5, 6));
+
+    // Practice Mode: behaves like Guide Mode (waits for user, never skips), previews upcoming pads with gradual brightening,
+    // pauses at chain switch, and syncs gradual white brightness (117->1->2->3) to Launchpad.
+    pk.auto_play = try pa.dupe(pack_mod.AutoPlayEvent, &.{
+        .{ .on = .{ .row = 1, .col = 2 } },
+        .{ .delay = 800 },
+        .{ .on = .{ .row = 3, .col = 4 } },
+        .{ .delay = 200 },
+        .{ .chain = 1 },
+        .{ .on = .{ .row = 5, .col = 6 } },
+    });
+    player.setGuideMode(false);
+    player.clearOutEvents();
+    player.startPractice(1000.0);
+    try std.testing.expect(player.practice_playing);
+    // First pad waits at full brightness (vel 3); next 1 chord (3,4) previews in dim blue (vel 47)
+    try std.testing.expectEqual(@as(u8, 3), player.guidePadVelocity(1, 2));
+    try std.testing.expectEqual(@as(u8, 47), player.guidePadVelocity(3, 4));
+    // Even after waiting 5 seconds without pressing, Practice Mode still waits on (1,2)
+    player.tick(6000.0);
+    try std.testing.expectEqual(@as(u8, 3), player.guidePadVelocity(1, 2));
+    // Press (1,2) -> advances to (3,4) 800ms away: stays dim blue preview (vel 47) until final 180ms ramp, then full white (vel 3)
+    player.pressPad(1, 2, 6000.0, false);
+    try std.testing.expectEqual(@as(u8, 0), player.guidePadVelocity(1, 2));
+    try std.testing.expectEqual(@as(u8, 47), player.guidePadVelocity(3, 4));
+    player.tick(6500.0); // 300ms remaining -> still dim preview
+    try std.testing.expectEqual(@as(u8, 47), player.guidePadVelocity(3, 4));
+    player.tick(6740.0); // 60ms remaining -> brightening (vel 2)
+    try std.testing.expectEqual(@as(u8, 2), player.guidePadVelocity(3, 4));
+    player.tick(6800.0); // due now -> full brightness (vel 3)
+    try std.testing.expectEqual(@as(u8, 3), player.guidePadVelocity(3, 4));
+    // Press (3,4) -> pauses automatically at chain 1 transition
+    player.pressPad(3, 4, 6800.0, false);
+    try std.testing.expectEqual(@as(?u8, 1), player.practice_paused_chain);
+    try std.testing.expect(player.isGuideChain(1));
+    // Switch to chain 1 -> resumes and waits at full brightness on (5,6)
+    player.setChain(1);
+    try std.testing.expectEqual(@as(?u8, null), player.practice_paused_chain);
+    try std.testing.expectEqual(@as(u8, 3), player.guidePadVelocity(5, 6));
 }

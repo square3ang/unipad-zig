@@ -12,6 +12,11 @@ All bundled and linked components are compatible with GPLv3.
 | [dr_wav, dr_flac, dr_mp3](https://github.com/mackron/dr_libs) | Public Domain / MIT-0 | `third_party/dr_*.h` | Audio decoding |
 | [stb_vorbis](https://github.com/nothings/stb) | Public Domain / MIT | `third_party/stb_vorbis.c` | Ogg Vorbis decoding |
 | [SUITE font](https://github.com/sun-typeface/SUITE) | SIL OFL 1.1 | `assets/fonts/SUITE-*.ttf` (`assets/fonts/LICENSE-SUITE.txt`) | UI typography (embedded) |
+| [LinnDrum LM-2 samples](https://github.com/oramics/sampled/tree/master/DM/LM-2) | Public Domain | `assets/drums/ld_*.wav` | Fallback LinnDrum one-shots for uncollected Ableton Core Library drums |
+| [TR-808 samples (Michael Fischer)](https://github.com/tidalcycles/sounds-tr808-fischer) | CC0-1.0 | `assets/drums/808_*.wav` | Fallback Roland TR-808 one-shots for uncollected Ableton Core Library drums |
+| [TR-909 samples (0x808)](https://github.com/averagenative/0x808/tree/main/samples/909) | MIT / Royalty-free PD | `assets/drums/909_*.wav` | Fallback Roland TR-909 one-shots for uncollected Ableton Core Library drums |
+| [uzu-drumkit](https://github.com/tidalcycles/uzu-drumkit) | Unlicense | `assets/drums/uzu_*.wav` | Fallback electronic kick/snare one-shots |
+| [LMMS drum samples](https://github.com/LMMS/lmms/tree/master/data/samples/drums) | GPL-2.0-or-later | `assets/drums/lmms_*.ogg` | Fallback electronic drum one-shots for uncollected Ableton Core Library drums |
 
 ## Linked System Libraries
 

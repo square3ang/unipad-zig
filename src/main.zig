@@ -4,12 +4,14 @@ const config_mod = @import("config.zig");
 const engine_mod = @import("audio/engine.zig");
 const app_mod = @import("ui/app.zig");
 const midi_driver = @import("midi/driver.zig");
+const ableton = @import("unipack/ableton.zig");
 
 comptime {
     _ = @import("config.zig");
     _ = @import("audio/engine.zig");
     _ = @import("unipack/palette.zig");
     _ = @import("unipack/pack.zig");
+    _ = @import("unipack/ableton.zig");
     _ = @import("unipack/player.zig");
     _ = @import("midi/driver.zig");
     _ = @import("midi/backend.zig");
@@ -20,7 +22,8 @@ comptime {
 }
 
 const usage =
-    \\usage: unipad-zig [pack.zip|pack.uni|pack_dir] [options]
+    \\usage: unipad-zig [pack.zip|pack.uni|project.als|dir] [options]
+    \\  --convert IN OUT.zip   convert an Ableton project (.zip/.als/dir) to a UniPack .zip
     \\  --auto                 start AutoPlay immediately after loading
     \\  --null-audio           run without audio output device
     \\  --audio-device NAME    open specific ALSA (Linux) or PortAudio device
@@ -37,6 +40,8 @@ pub fn main(init: std.process.Init) !void {
     const args = try init.minimal.args.toSlice(init.arena.allocator());
 
     var pack_path: ?[]const u8 = null;
+    var convert_in: ?[]const u8 = null;
+    var convert_out: ?[]const u8 = null;
     var auto_start = false;
     var null_audio = false;
     var cli_audio_device: ?[]const u8 = null;
@@ -52,6 +57,10 @@ pub fn main(init: std.process.Init) !void {
             w.interface.writeAll(usage) catch {};
             w.interface.flush() catch {};
             return;
+        } else if (std.mem.eql(u8, arg, "--convert") and i + 2 < args.len) {
+            convert_in = args[i + 1];
+            convert_out = args[i + 2];
+            i += 2;
         } else if (std.mem.eql(u8, arg, "--auto")) {
             auto_start = true;
         } else if (std.mem.eql(u8, arg, "--null-audio")) {
@@ -68,6 +77,18 @@ pub fn main(init: std.process.Init) !void {
         } else if (!std.mem.startsWith(u8, arg, "-")) {
             pack_path = arg;
         }
+    }
+
+    if (convert_in != null and convert_out != null) {
+        const sum = try ableton.convertToUniPackZip(gpa, io, convert_in.?, convert_out.?);
+        var buf: [512]u8 = undefined;
+        var w = std.Io.File.stdout().writer(io, &buf);
+        w.interface.print(
+            "Converted Ableton project -> {s}\n  chains: {d}, sounds: {d}, led_pads: {d} ({d} events), autoPlay: {d} events\n",
+            .{ convert_out.?, sum.chains, sum.sounds, sum.led_pads, sum.led_events, sum.auto_events },
+        ) catch {};
+        w.interface.flush() catch {};
+        return;
     }
 
     if (!c.SDL_Init(c.SDL_INIT_VIDEO | c.SDL_INIT_EVENTS)) {

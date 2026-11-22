@@ -30,6 +30,7 @@ pub fn build(b: *std.Build) void {
     mod.addIncludePath(b.path("src/midi"));
     mod.addAnonymousImport("font_medium", .{ .root_source_file = b.path("assets/fonts/SUITE-Medium.ttf") });
     mod.addAnonymousImport("font_heavy", .{ .root_source_file = b.path("assets/fonts/SUITE-ExtraBold.ttf") });
+    mod.addAnonymousImport("drums_bank", .{ .root_source_file = b.path("assets/drums/drums.zig") });
 
     const shaders = [_][]const u8{ "sprite.vert", "sprite.frag" };
     for (shaders) |name| {

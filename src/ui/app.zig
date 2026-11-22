@@ -5,6 +5,7 @@ const c = @import("c");
 const gfx = @import("../render/gfx.zig");
 const engine_mod = @import("../audio/engine.zig");
 const pack_mod = @import("../unipack/pack.zig");
+const ableton_mod = @import("../unipack/ableton.zig");
 const player_mod = @import("../unipack/player.zig");
 const midi_backend = @import("../midi/backend.zig");
 const midi_driver = @import("../midi/driver.zig");
@@ -22,6 +23,7 @@ const model_labels = blk: {
 };
 
 const DragSlider = enum { none, volume, speed };
+const DialogKind = enum { open_file, open_folder, export_zip };
 
 const PadCoord = struct { row: u8, col: u8 };
 
@@ -61,7 +63,9 @@ pub const App = struct {
     dialog_lock: std.atomic.Value(bool) = .init(false),
     dialog_busy: std.atomic.Value(bool) = .init(false),
     dialog_thread: ?*c.SDL_Thread = null,
+    pending_dialog_kind: DialogKind = .open_file,
     pending_open_path: ?[]u8 = null,
+    last_pack_path: ?[]u8 = null,
 
     // Settings state
     cfg: config_mod.Config = .{},
@@ -104,6 +108,7 @@ pub const App = struct {
         a.player.speed_multiplier = cfg.speed_multiplier;
         a.midi.auto_model = cfg.midi_auto;
         a.midi.model = cfg.midi_model;
+        a.midi.fast_led_enabled = cfg.midi_fast_led;
 
         a.refreshDevices();
         // Match saved audio device name to dropdown index
@@ -151,6 +156,7 @@ pub const App = struct {
             a.dialog_thread = null;
         }
         if (a.pending_open_path) |p| a.gpa.free(p);
+        if (a.last_pack_path) |p| a.gpa.free(p);
         if (a.nfd_ready) c.NFD_Quit();
         a.midi.sendClearLed();
         a.midi.deinit();
@@ -171,6 +177,7 @@ pub const App = struct {
         a.cfg.anti_pop = a.anti_pop;
         a.cfg.midi_auto = a.midi.auto_model;
         a.cfg.midi_model = a.midi.model;
+        a.cfg.midi_fast_led = a.midi.fast_led_enabled;
         a.cfg.setMidiPort(a.midi.connectedLabel());
         a.cfg.led_enabled = a.player.led_enabled;
         a.cfg.show_chain = a.player.show_chain;
@@ -216,9 +223,15 @@ pub const App = struct {
             a.setStatus("Load failed: {t}", .{err});
             return;
         };
+        if (a.last_pack_path) |old| a.gpa.free(old);
+        a.last_pack_path = a.gpa.dupe(u8, path) catch null;
         a.player.loadPack(pk);
         a.flushLedToMidi();
-        a.setStatus("Loaded: {s} ({d} sounds, {d} LEDs, {d} chains)", .{ pk.title, pk.sound_count, pk.led_count, pk.chain_count });
+        if (pk.from_ableton) {
+            a.setStatus("Ableton converted: {s} ({d} sounds, {d} LEDs, {d} chains)", .{ pk.title, pk.sound_count, pk.led_count, pk.chain_count });
+        } else {
+            a.setStatus("Loaded: {s} ({d} sounds, {d} LEDs, {d} chains)", .{ pk.title, pk.sound_count, pk.led_count, pk.chain_count });
+        }
     }
 
     pub fn run(a: *App) void {
@@ -254,21 +267,33 @@ pub const App = struct {
         }
         while (a.dialog_lock.swap(true, .acquire)) std.atomic.spinLoopHint();
         const path = a.pending_open_path;
+        const kind = a.pending_dialog_kind;
         a.pending_open_path = null;
         a.dialog_lock.store(false, .release);
         if (path) |p| {
             defer a.gpa.free(p);
-            a.loadPackPath(p);
+            if (kind == .export_zip) {
+                if (a.last_pack_path) |src| {
+                    const sum = ableton_mod.convertToUniPackZip(a.gpa, a.io, src, p) catch |err| {
+                        std.log.err("export UniPack failed: {t}", .{err});
+                        a.setStatus("Export failed: {t}", .{err});
+                        return;
+                    };
+                    a.setStatus("Exported UniPack ({d} sounds, {d} LEDs, {d} chains)", .{ sum.sounds, sum.led_pads, sum.chains });
+                }
+            } else {
+                a.loadPackPath(p);
+            }
         }
     }
 
     const DialogJob = struct {
         app: *App,
-        folder: bool,
+        kind: DialogKind,
         parent: c.nfdwindowhandle_t,
     };
 
-    fn openNativeDialog(a: *App, folder: bool) void {
+    fn openNativeDialog(a: *App, kind: DialogKind) void {
         if (!a.nfd_ready) {
             a.setStatus("Native dialog unavailable", .{});
             return;
@@ -290,7 +315,7 @@ pub const App = struct {
             a.dialog_busy.store(false, .release);
             return;
         };
-        job.* = .{ .app = a, .folder = folder, .parent = parent };
+        job.* = .{ .app = a, .kind = kind, .parent = parent };
 
         if (builtin.os.tag == .macos) {
             _ = dialogWorker(job);
@@ -309,21 +334,36 @@ pub const App = struct {
         }
 
         var out_path: [*c]c.nfdu8char_t = null;
-        const res: c.nfdresult_t = if (job.folder) blk: {
-            var args: c.nfdpickfolderu8args_t = std.mem.zeroes(c.nfdpickfolderu8args_t);
-            args.parentWindow = job.parent;
-            args.title = "Open UniPack Folder";
-            break :blk c.NFD_PickFolderU8_With(&out_path, &args);
-        } else blk: {
-            const filters = [_]c.nfdu8filteritem_t{
-                .{ .name = "UniPack Archives", .spec = "zip,uni" },
-            };
-            var args: c.nfdopendialogu8args_t = std.mem.zeroes(c.nfdopendialogu8args_t);
-            args.filterList = &filters;
-            args.filterCount = filters.len;
-            args.parentWindow = job.parent;
-            args.title = "Open UniPack";
-            break :blk c.NFD_OpenDialogU8_With(&out_path, &args);
+        const res: c.nfdresult_t = switch (job.kind) {
+            .open_folder => blk: {
+                var args: c.nfdpickfolderu8args_t = std.mem.zeroes(c.nfdpickfolderu8args_t);
+                args.parentWindow = job.parent;
+                args.title = "Open UniPack / Ableton Folder";
+                break :blk c.NFD_PickFolderU8_With(&out_path, &args);
+            },
+            .open_file => blk: {
+                const filters = [_]c.nfdu8filteritem_t{
+                    .{ .name = "UniPack / Ableton Project", .spec = "zip,uni,als" },
+                };
+                var args: c.nfdopendialogu8args_t = std.mem.zeroes(c.nfdopendialogu8args_t);
+                args.filterList = &filters;
+                args.filterCount = filters.len;
+                args.parentWindow = job.parent;
+                args.title = "Open UniPack or Ableton Project";
+                break :blk c.NFD_OpenDialogU8_With(&out_path, &args);
+            },
+            .export_zip => blk: {
+                const filters = [_]c.nfdu8filteritem_t{
+                    .{ .name = "UniPack Archive", .spec = "zip" },
+                };
+                var args: c.nfdsavedialogu8args_t = std.mem.zeroes(c.nfdsavedialogu8args_t);
+                args.filterList = &filters;
+                args.filterCount = filters.len;
+                args.defaultName = "unipack.zip";
+                args.parentWindow = job.parent;
+                args.title = "Export UniPack (.zip)";
+                break :blk c.NFD_SaveDialogU8_With(&out_path, &args);
+            },
         };
 
         if (res == c.NFD_OKAY and out_path != null) {
@@ -332,6 +372,7 @@ pub const App = struct {
             if (a.gpa.dupe(u8, path)) |dup| {
                 while (a.dialog_lock.swap(true, .acquire)) std.atomic.spinLoopHint();
                 if (a.pending_open_path) |old| a.gpa.free(old);
+                a.pending_dialog_kind = job.kind;
                 a.pending_open_path = dup;
                 a.dialog_lock.store(false, .release);
             } else |_| {}
@@ -367,9 +408,9 @@ pub const App = struct {
         if (evs.len == 0) return;
         if (a.midi.connected_out != null) {
             for (evs) |ev| switch (ev) {
-                .pad => |p| a.midi.sendPadLed(p.row, p.col, p.velocity),
-                .ring => |r| a.midi.sendRingLed(r.idx, r.velocity),
-                .clear => a.midi.sendClearLed(),
+                .pad => |p| a.midi.sendPadLed(p.row, p.col, p.velocity, p.color),
+                .ring => |r| a.midi.sendRingLed(r.idx, r.velocity, r.color),
+                .clear => a.midi.queueClearLed(),
             };
             a.midi.flush();
         }
@@ -464,7 +505,7 @@ pub const App = struct {
                 },
                 c.SDL_SCANCODE_O => {
                     const shift = (mod & c.SDL_KMOD_SHIFT) != 0;
-                    a.openNativeDialog(shift);
+                    a.openNativeDialog(if (shift) .open_folder else .open_file);
                     return;
                 },
                 c.SDL_SCANCODE_TAB => {
@@ -480,6 +521,10 @@ pub const App = struct {
                 },
                 c.SDL_SCANCODE_SPACE => {
                     if (a.player.auto_playing) a.player.stopAutoPlay() else a.player.startAutoPlay(now);
+                    return;
+                },
+                c.SDL_SCANCODE_P => {
+                    if (a.player.practice_playing) a.player.stopPractice() else a.player.startPractice(now);
                     return;
                 },
                 c.SDL_SCANCODE_BACKSPACE => {
@@ -645,7 +690,7 @@ pub const App = struct {
         const sub = if (a.player.pack) |pk|
             (if (pk.producer.len > 0) pk.producer else "Loaded UniPack")
         else
-            "Drop .zip / .uni pack or click Open";
+            "Drop .zip / .uni / .als or click Open";
         g.textClip(title, 30, 12, g.w * 0.30, 18, gfx.white);
         g.textClip(sub, 30, 36, g.w * 0.30, 12, gfx.dim);
 
@@ -671,6 +716,16 @@ pub const App = struct {
         rx -= 6;
 
         const has_auto = if (a.player.pack) |pk| pk.auto_play.len > 0 else false;
+        rx -= 88;
+        if (a.button(rx, by, 88, bh, if (a.player.practice_playing) "Stop Prac" else "Practice", a.player.practice_playing)) {
+            if (has_auto) {
+                if (a.player.practice_playing) a.player.stopPractice() else a.player.startPractice(now);
+            } else {
+                a.setStatus("No autoPlay file in pack", .{});
+            }
+        }
+        rx -= 6;
+
         rx -= 92;
         if (a.button(rx, by, 92, bh, if (a.player.auto_playing) "Stop Auto" else "AutoPlay", a.player.auto_playing)) {
             if (has_auto) {
@@ -681,18 +736,28 @@ pub const App = struct {
         }
         rx -= 12;
 
-        // File group: Folder + Open
+        // File group: Folder + Open (+ Export when Ableton project loaded)
         rx -= 74;
         if (a.button(rx, by, 74, bh, "Folder", false)) {
-            a.openNativeDialog(true);
+            a.openNativeDialog(.open_folder);
         }
         rx -= 6;
 
         rx -= 72;
         if (a.button(rx, by, 72, bh, "Open", false)) {
-            a.openNativeDialog(false);
+            a.openNativeDialog(.open_file);
         }
-        rx -= 12;
+        rx -= 6;
+
+        const is_ableton = if (a.player.pack) |pk| pk.from_ableton else false;
+        if (is_ableton and a.last_pack_path != null) {
+            rx -= 78;
+            if (a.button(rx, by, 78, bh, "Export", false)) {
+                a.openNativeDialog(.export_zip);
+            }
+            rx -= 6;
+        }
+        rx -= 6;
 
         // MIDI status pill (opens Settings on click)
         const midi_w: f32 = 156;
@@ -714,10 +779,13 @@ pub const App = struct {
             a.refreshDevices();
         }
 
-        // AutoPlay progress bar along header bottom
+        // AutoPlay / Practice Mode progress bar along header bottom
         if (a.player.auto_playing) {
             const prog = a.player.autoProgress();
             g.rect(0, bar_h - 3, g.w * prog, 3, gfx.accent);
+        } else if (a.player.practice_playing) {
+            const prog = a.player.practiceProgress();
+            g.rect(0, bar_h - 3, g.w * prog, 3, if (a.player.practice_paused_chain != null) gfx.warn else gfx.good);
         }
     }
 
@@ -819,18 +887,25 @@ pub const App = struct {
                 const idx = @as(usize, r) * pack_mod.max_grid + col_i;
                 const led = a.player.pad_leds[idx];
                 const pressed = a.player.pad_pressed[idx];
-                const is_guide_pad = a.player.isGuidePad(r, col_i);
+                const guide_lvl = a.player.guidePadLevel(r, col_i);
+                const is_guide_pad = guide_lvl > 0.0;
+                const is_guide_now = guide_lvl >= 0.30;
                 const led_lit = led.velocity != 0 or (led.color & 0x00FFFFFF) != 0;
-                const lit = led_lit or is_guide_pad;
+                const lit = led_lit or is_guide_now;
 
+                const idle_col: Color = .{ .r = 38, .g = 42, .b = 54 };
+                const guide_col = if (is_guide_now)
+                    gfx.mix(idle_col, gfx.white, std.math.clamp((guide_lvl - 0.25) / 0.75, 0.25, 1.0))
+                else
+                    gfx.mix(idle_col, gfx.accent, 0.22);
                 const base_col: Color = if (led_lit)
                     ledColor(led.color)
                 else if (is_guide_pad)
-                    gfx.white
+                    guide_col
                 else if (pressed)
                     .{ .r = 104, .g = 114, .b = 140 }
                 else
-                    .{ .r = 38, .g = 42, .b = 54 };
+                    idle_col;
 
                 const corner: u8 = if (l.rows == 8 and l.cols == 8) blk: {
                     if (r == 3 and col_i == 3) break :blk 1; // BR
@@ -840,11 +915,14 @@ pub const App = struct {
                     break :blk 0;
                 } else 0;
 
-                // Two-stage LED bloom for lit pads
+                // Two-stage LED bloom for lit pads (no bloom on dim next-step preview)
                 if (lit) {
-                    g.additive(true);
-                    g.round(px - l.gap * 0.55, py - l.gap * 0.55, l.cell + l.gap * 1.1, l.cell + l.gap * 1.1, l.cell * 0.22, base_col.alpha(70));
-                    g.additive(false);
+                    const bloom_a: u8 = if (!led_lit and is_guide_now) @intFromFloat(@round(70.0 * guide_lvl * guide_lvl)) else 70;
+                    if (bloom_a > 2) {
+                        g.additive(true);
+                        g.round(px - l.gap * 0.55, py - l.gap * 0.55, l.cell + l.gap * 1.1, l.cell + l.gap * 1.1, l.cell * 0.22, base_col.alpha(bloom_a));
+                        g.additive(false);
+                    }
                 }
 
                 // Dark recessed socket border
@@ -860,7 +938,10 @@ pub const App = struct {
                     // Diffused hot core inside LED silicone
                     const core_in = face_in + face_s * 0.16;
                     const core_s = face_s * 0.68;
-                    g.round(px + core_in, py + core_in, core_s, core_s, core_s * 0.24, gfx.mix(base_col, gfx.white, 0.34).alpha(145));
+                    const core_a: u8 = if (!led_lit and is_guide_now) @intFromFloat(@round(145.0 * guide_lvl * guide_lvl)) else 145;
+                    if (core_a > 4) {
+                        g.round(px + core_in, py + core_in, core_s, core_s, core_s * 0.24, gfx.mix(base_col, gfx.white, 0.34).alpha(core_a));
+                    }
                 } else {
                     // Subtle matte top sheen on unlit silicone
                     g.rect(px + face_in + 4, py + face_in + 1, @max(face_s - 8, 2), 1.2, .{ .r = 74, .g = 82, .b = 104, .a = 90 });
@@ -870,9 +951,13 @@ pub const App = struct {
                     g.rectOutline(px + inset, py + inset, l.cell - inset * 2, l.cell - inset * 2, 2.0, gfx.white.alpha(180));
                 }
 
-                // White guide highlight (keeps white guide clearly visible even over active LED colors)
-                if (is_guide_pad) {
-                    g.ring(px + l.cell / 2, py + l.cell / 2, l.cell * 0.32, 3.0, gfx.white);
+                // Distinct guide indicator: bold white ring for Press NOW vs subtle cyan ring for Next preview
+                if (is_guide_now) {
+                    const ring_r = l.cell * (0.38 - 0.08 * guide_lvl);
+                    const ring_w = 2.0 + 1.4 * guide_lvl;
+                    g.ring(px + l.cell / 2, py + l.cell / 2, ring_r, ring_w, gfx.white);
+                } else if (is_guide_pad) {
+                    g.ring(px + l.cell / 2, py + l.cell / 2, l.cell * 0.36, 1.8, gfx.accent.alpha(185));
                 }
             }
         }
@@ -917,7 +1002,17 @@ pub const App = struct {
             const s = a.status_msg[0..a.status_len];
             g.textRight(s, g.w - 16, fy + 9, 12, gfx.white);
         } else {
-            g.textRight("O: Open   Shift+O: Folder   Space: AutoPlay   Tab: Settings", g.w - 16, fy + 9, 12, gfx.dim);
+            if (a.player.practice_playing) {
+                if (a.player.practice_paused_chain) |pch| {
+                    var pbuf: [80]u8 = undefined;
+                    const ptxt = std.fmt.bufPrint(&pbuf, "Practice paused - switch to Chain {d} to continue", .{pch + 1}) catch "Practice paused";
+                    g.textRight(ptxt, g.w - 16, fy + 9, 12, gfx.warn);
+                } else {
+                    g.textRight("Practice Mode active   P: Stop   Space: AutoPlay", g.w - 16, fy + 9, 12, gfx.good);
+                }
+            } else {
+                g.textRight("O: Open   Space: AutoPlay   P: Practice   Tab: Settings", g.w - 16, fy + 9, 12, gfx.dim);
+            }
         }
     }
 
@@ -931,7 +1026,7 @@ pub const App = struct {
         g.rect(0, 64, g.w, g.h - 64, .{ .r = 0, .g = 0, .b = 0, .a = 175 });
 
         const pw: f32 = @min(600, g.w - 40);
-        const ph: f32 = @min(560, g.h - 104);
+        const ph: f32 = @min(596, g.h - 92);
         const px = (g.w - pw) / 2;
         const py = 64 + (g.h - 64 - ph) / 2;
 
@@ -953,7 +1048,7 @@ pub const App = struct {
         var y = py + 66;
 
         // === Card 1: MIDI Launchpad ===
-        const midi_card_h: f32 = 128;
+        const midi_card_h: f32 = 166;
         g.roundBox(lx, y, cw, midi_card_h, 12, gfx.card, gfx.border_col.alpha(130));
         g.text("MIDI LAUNCHPAD", lx + 16, y + 12, 12, gfx.accent);
         const midi_badge_col = if (a.midi.isConnected()) gfx.good else gfx.dim;
@@ -994,6 +1089,22 @@ pub const App = struct {
             a.refreshDevices();
             a.setStatus("Found {d} MIDI port(s)", .{a.midi_ports.len});
         }
+
+        // Row 3: FastLED toggle (CoreFW / Pro CFW 0xF0 0x5F RGB SysEx)
+        const r3y = y + 124;
+        g.text("FastLED", lx + 16, r3y + 7, 14, gfx.dim);
+        if (a.pillToggle(field_x, r3y, 128, 32, "FastLED", a.midi.fast_led_enabled)) {
+            a.midi.setFastLedEnabled(!a.midi.fast_led_enabled);
+            a.player.pushFullLedSync();
+            a.flushLedToMidi();
+            a.saveConfig();
+            a.setStatus("FastLED {s}", .{if (a.midi.fast_led_enabled) "ON" else "OFF"});
+        }
+        const fastled_hint = if (a.midi.model.supportsFastLed())
+            (if (a.midi.fast_led_enabled) "0x5F RGB SysEx active" else "Standard Note-On (device palette)")
+        else
+            "CoreFW / Pro CFW only";
+        g.text(fastled_hint, field_x + 140, r3y + 8, 12, gfx.dim);
 
         y += midi_card_h + 12;
 
