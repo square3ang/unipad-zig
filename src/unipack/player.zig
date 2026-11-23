@@ -93,6 +93,9 @@ pub const Player = struct {
     guide_chain: ?u8 = null,
     prev_guide_pads: [pack_mod.max_grid * pack_mod.max_grid]u8 = @splat(0),
     prev_guide_chain: ?u8 = null,
+    smooth_guide_rgb: bool = false, // True when hardware output uses FastLED 0x5F 6-bit RGB
+    prev_guide_rgb: [pack_mod.max_grid * pack_mod.max_grid]u32 = @splat(0),
+    prev_guide_chain_rgb: u32 = 0,
 
     pub fn init(gpa: std.mem.Allocator, engine: *engine_mod.Engine) Player {
         return .{ .gpa = gpa, .engine = engine };
@@ -216,6 +219,8 @@ pub const Player = struct {
         @memset(&p.ring_leds, .{});
         @memset(&p.prev_guide_pads, 0);
         p.prev_guide_chain = null;
+        @memset(&p.prev_guide_rgb, 0);
+        p.prev_guide_chain_rgb = 0;
         p.out_events.append(p.gpa, .clear) catch {};
         p.refreshChainLed();
         p.syncGuideLeds();
@@ -508,10 +513,11 @@ pub const Player = struct {
         @memset(&p.practice_pad_level, 0);
         if (!p.practice_playing or p.practice_paused_chain != null) return;
 
-        const ramp_ms: f64 = 180.0;
+        const ramp_ms: f64 = if (p.smooth_guide_rgb) 320.0 else 180.0;
+        const ramp_floor: f64 = if (p.smooth_guide_rgb) 0.25 else 0.35;
         const chord_end = p.currentPracticeChordEnd();
 
-        // 1. Current chord (press NOW -> 1.0 full white; approaching within 180ms -> ramp 0.35..1.0; earlier -> 0.20 preview)
+        // 1. Current chord (press NOW -> 1.0 full white; approaching within ramp_ms -> smooth ramp; earlier -> 0.20 preview)
         var i = p.practice_cursor;
         while (i < chord_end) : (i += 1) {
             const st = p.practice_steps.items[i];
@@ -520,7 +526,7 @@ pub const Player = struct {
             const prog: f32 = if (rem <= 0.0)
                 1.0
             else if (rem <= ramp_ms)
-                @floatCast(0.35 + 0.65 * (1.0 - rem / ramp_ms))
+                @floatCast(ramp_floor + (1.0 - ramp_floor) * (1.0 - rem / ramp_ms))
             else
                 0.20;
             const pidx = @as(usize, st.row) * pack_mod.max_grid + st.col;
@@ -703,8 +709,13 @@ pub const Player = struct {
         if (!cell.owned) return;
         if (cell.owner_pad_row == orow and cell.owner_pad_col == ocol and cell.owner_chain == ochain) {
             cell.* = .{};
-            const gvel = p.guidePadVelocity(row, col);
-            p.out_events.append(p.gpa, .{ .pad = .{ .row = row, .col = col, .velocity = gvel, .color = palette.argbOf(gvel) } }) catch {};
+            if (p.smooth_guide_rgb) {
+                const gargb = p.guidePadFastLedArgb(row, col);
+                p.out_events.append(p.gpa, .{ .pad = .{ .row = row, .col = col, .velocity = 0, .color = gargb } }) catch {};
+            } else {
+                const gvel = p.guidePadVelocity(row, col);
+                p.out_events.append(p.gpa, .{ .pad = .{ .row = row, .col = col, .velocity = gvel, .color = palette.argbOf(gvel) } }) catch {};
+            }
         }
     }
 
@@ -771,6 +782,8 @@ pub const Player = struct {
         }
         @memset(&p.prev_guide_pads, 0);
         p.prev_guide_chain = null;
+        @memset(&p.prev_guide_rgb, 0);
+        p.prev_guide_chain_rgb = 0;
         p.syncGuideLeds();
     }
 
@@ -791,6 +804,33 @@ pub const Player = struct {
         if (p.practice_playing) return p.practice_pad_level[idx];
         if (p.guide_mode and p.guide_pads[idx]) return 1.0;
         return 0.0;
+    }
+
+    fn packRgb6(r6: u8, g6: u8, b6: u8) u32 {
+        return 0xFF000000 | (@as(u32, r6) << 18) | (@as(u32, g6) << 10) | (@as(u32, b6) << 2);
+    }
+
+    /// Continuous 6-bit RGB guide color for FastLED (0xF0 0x5F) Practice Mode:
+    /// dim cool blue preview -> quadratic perceptual ease-in -> breathing pure white at beat.
+    pub fn guidePadFastLedArgb(p: *const Player, row: u8, col: u8) u32 {
+        const lvl = p.guidePadLevel(row, col);
+        if (lvl <= 0.0) return 0;
+        if (lvl <= 0.15) return packRgb6(0, 3, 12);
+        if (lvl < 0.25) return packRgb6(1, 5, 16);
+        if (lvl < 1.0) {
+            const t: f64 = std.math.clamp((@as(f64, lvl) - 0.25) / 0.75, 0.0, 1.0);
+            const e = t * t; // Linear PWM quadratic curve matches perceptual brightness ramp
+            const r6: u8 = @intFromFloat(@round(1.0 + 62.0 * e));
+            const g6: u8 = @intFromFloat(@round(5.0 + 58.0 * e));
+            const b6: u8 = @intFromFloat(@round(16.0 + 47.0 * t));
+            return packRgb6(r6, g6, b6);
+        }
+        if (p.practice_playing) {
+            const k = 0.5 + 0.5 * @cos(p.practice_last_ms * 0.0088);
+            const w: u8 = @intFromFloat(@round(50.0 + 13.0 * k));
+            return packRgb6(w, w, w);
+        }
+        return packRgb6(63, 63, 63);
     }
 
     pub fn guidePadVelocity(p: *const Player, row: u8, col: u8) u8 {
@@ -915,9 +955,60 @@ pub const Player = struct {
         }
     }
 
-    /// Diffs current vs previous guide targets and emits hardware MIDI guide LEDs (gradual white 117->1->2->3).
+    /// Diffs current vs previous guide targets and emits hardware MIDI guide LEDs.
+    /// Uses continuous 6-bit RGB ramps/breathing when FastLED (`smooth_guide_rgb`) is active, else 4-step palette velocities.
     pub fn syncGuideLeds(p: *Player) void {
         const pk = p.pack orelse return;
+        const want_chain: ?u8 = if (p.practice_playing)
+            p.practice_paused_chain
+        else if (p.guide_mode)
+            p.guide_chain
+        else
+            null;
+
+        if (p.smooth_guide_rgb) {
+            for (0..pk.button_x) |r| {
+                for (0..pk.button_y) |col_i| {
+                    const idx = r * pack_mod.max_grid + col_i;
+                    const want_argb = p.guidePadFastLedArgb(@intCast(r), @intCast(col_i));
+                    if (want_argb == p.prev_guide_rgb[idx]) continue;
+                    p.prev_guide_rgb[idx] = want_argb;
+                    p.prev_guide_pads[idx] = p.guidePadVelocity(@intCast(r), @intCast(col_i));
+                    if (want_argb != 0) {
+                        p.out_events.append(p.gpa, .{ .pad = .{ .row = @intCast(r), .col = @intCast(col_i), .velocity = 0, .color = want_argb } }) catch {};
+                    } else {
+                        p.out_events.append(p.gpa, .{ .pad = .{ .row = @intCast(r), .col = @intCast(col_i), .velocity = p.pad_leds[idx].velocity, .color = p.pad_leds[idx].color } }) catch {};
+                    }
+                }
+            }
+
+            if (want_chain != p.prev_guide_chain) {
+                if (p.prev_guide_chain) |old_ch| {
+                    const ridx = old_ch + 8;
+                    if (ridx < pack_mod.round_led_count) {
+                        p.out_events.append(p.gpa, .{ .ring = .{ .idx = ridx, .velocity = p.ring_leds[ridx].velocity, .color = p.ring_leds[ridx].color } }) catch {};
+                    }
+                }
+                p.prev_guide_chain = want_chain;
+                p.prev_guide_chain_rgb = 0;
+            }
+            if (want_chain) |new_ch| {
+                const ridx = new_ch + 8;
+                if (ridx < pack_mod.round_led_count) {
+                    const chain_argb = if (p.practice_playing) blk: {
+                        const k = 0.5 + 0.5 * @cos(p.practice_last_ms * 0.010);
+                        const w: u8 = @intFromFloat(@round(24.0 + 39.0 * k));
+                        break :blk packRgb6(w, w, w);
+                    } else packRgb6(63, 63, 63);
+                    if (chain_argb != p.prev_guide_chain_rgb) {
+                        p.prev_guide_chain_rgb = chain_argb;
+                        p.out_events.append(p.gpa, .{ .ring = .{ .idx = ridx, .velocity = 0, .color = chain_argb } }) catch {};
+                    }
+                }
+            }
+            return;
+        }
+
         for (0..pk.button_x) |r| {
             for (0..pk.button_y) |col_i| {
                 const idx = r * pack_mod.max_grid + col_i;
@@ -930,12 +1021,6 @@ pub const Player = struct {
             }
         }
 
-        const want_chain: ?u8 = if (p.practice_playing)
-            p.practice_paused_chain
-        else if (p.guide_mode)
-            p.guide_chain
-        else
-            null;
         if (want_chain != p.prev_guide_chain) {
             if (p.prev_guide_chain) |old_ch| {
                 const ridx = old_ch + 8;
@@ -1066,4 +1151,30 @@ test "player runs LED animations, ownership off, held loops, and autoplay" {
     player.setChain(1);
     try std.testing.expectEqual(@as(?u8, null), player.practice_paused_chain);
     try std.testing.expectEqual(@as(u8, 3), player.guidePadVelocity(5, 6));
+
+    // FastLED-only smooth RGB Practice Mode: continuous 6-bit RGB ramp & breathing white pulse
+    player.stopPractice();
+    player.setChain(0);
+    player.smooth_guide_rgb = true;
+    player.clearOutEvents();
+    player.startPractice(1000.0);
+    // Next chord (3,4) previews in subtle dim cool blue (0,3,12)
+    try std.testing.expectEqual(Player.packRgb6(0, 3, 12), player.guidePadFastLedArgb(3, 4));
+    // Press (1,2) -> (3,4) is 800ms away, enters smooth 320ms RGB ease-in ramp at 480ms
+    player.pressPad(1, 2, 1000.0, false);
+    player.tick(1560.0); // 240ms remaining (t=0.25)
+    const c_early = player.guidePadFastLedArgb(3, 4);
+    player.tick(1640.0); // 160ms remaining (t=0.50)
+    const c_mid = player.guidePadFastLedArgb(3, 4);
+    player.tick(1720.0); // 80ms remaining (t=0.75)
+    const c_late = player.guidePadFastLedArgb(3, 4);
+    try std.testing.expect(((c_early >> 18) & 0x3F) < ((c_mid >> 18) & 0x3F));
+    try std.testing.expect(((c_mid >> 18) & 0x3F) < ((c_late >> 18) & 0x3F));
+    // Due now -> bright breathing white within [50..63]
+    player.tick(1800.0);
+    const c_now = player.guidePadFastLedArgb(3, 4);
+    const w_now = (c_now >> 18) & 0x3F;
+    try std.testing.expect(w_now >= 50 and w_now <= 63);
+    try std.testing.expectEqual(w_now, (c_now >> 10) & 0x3F);
+    try std.testing.expectEqual(w_now, (c_now >> 2) & 0x3F);
 }

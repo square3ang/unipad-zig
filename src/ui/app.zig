@@ -240,6 +240,7 @@ pub const App = struct {
             a.handlePendingDialog();
             a.pollEvents(now);
             a.pollMidi(now);
+            a.player.smooth_guide_rgb = a.midi.useFastLed();
             a.player.tick(now);
             a.flushLedToMidi();
 
@@ -248,6 +249,7 @@ pub const App = struct {
                 a.last_midi_scan_ms = now;
                 a.refreshDevices();
                 if (a.midi.autoConnect(a.ports_arena.allocator())) {
+                    a.player.smooth_guide_rgb = a.midi.useFastLed();
                     a.player.pushFullLedSync();
                     a.flushLedToMidi();
                     a.setStatus("MIDI connected: {s}", .{a.midi.model.displayName()});
@@ -1165,6 +1167,7 @@ pub const App = struct {
         g.text("FastLED", lx + 16, r3y + 7, 14, gfx.dim);
         if (a.pillToggle(field_x, r3y, 128, 32, "FastLED", a.midi.fast_led_enabled)) {
             a.midi.setFastLedEnabled(!a.midi.fast_led_enabled);
+            a.player.smooth_guide_rgb = a.midi.useFastLed();
             a.player.pushFullLedSync();
             a.flushLedToMidi();
             a.saveConfig();
@@ -1298,6 +1301,7 @@ pub const App = struct {
                     a.midi.auto_model = true;
                     a.refreshDevices();
                     if (a.midi.autoConnect(a.ports_arena.allocator())) {
+                        a.player.smooth_guide_rgb = a.midi.useFastLed();
                         a.player.pushFullLedSync();
                         a.flushLedToMidi();
                         a.setStatus("Auto-detected: {s}", .{a.midi.model.displayName()});
@@ -1308,6 +1312,7 @@ pub const App = struct {
                     a.midi.auto_model = false;
                     a.midi.model = models[idx - 1];
                     a.midi.sendInit();
+                    a.player.smooth_guide_rgb = a.midi.useFastLed();
                     a.player.pushFullLedSync();
                     a.flushLedToMidi();
                     a.setStatus("Model: {s}", .{a.midi.model.displayName()});
