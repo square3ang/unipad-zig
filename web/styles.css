@@ -123,6 +123,30 @@ code {
   color: var(--accent);
 }
 
+.lang-btn {
+  appearance: none;
+  font: inherit;
+  font-size: 0.82rem;
+  font-weight: 600;
+  color: var(--ink);
+  background: transparent;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  padding: 0.28rem 0.6rem;
+  cursor: pointer;
+  transition: background-color 120ms ease, border-color 120ms ease, color 120ms ease;
+}
+
+.lang-btn:hover {
+  background: var(--surface-hover);
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.lang-btn:active {
+  background: var(--surface-code);
+}
+
 /* Main */
 .main-stack {
   flex: 1;
@@ -487,6 +511,7 @@ progress:dir(rtl) {
 @media (prefers-reduced-motion: reduce) {
   .dropzone,
   .btn,
+  .lang-btn,
   progress::-webkit-progress-value,
   progress::-moz-progress-bar {
     transition: none;
