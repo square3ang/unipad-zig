@@ -1,22 +1,25 @@
 //! Ableton Live (.als) Launchpad project converter & direct loader.
-//! Streams gzip-compressed .als XML via libarchive (no multi-hundred-MB DOM),
-//! extracts Drum Rack + Instrument Rack samples, simulates MIDI Effect Rack
-//! lightshows (Pitch, Chord, Velocity, Note Length, Arpeggiator), and builds
-//! AutoPlay from Arrangement MidiClips. Can load directly into UniPack or export
-//! a standard portable UniPack .zip archive.
+//! Streams gzip-compressed .als XML in pure Zig (no multi-hundred-MB DOM),
+//! extracts Drum Rack + Instrument Rack samples (with Simpler trim & layer mix),
+//! simulates MIDI Effect Rack lightshows (Pitch, Chord, Velocity, Note Length,
+//! Arpeggiator, Launchpad S->RGB color mapping), and builds AutoPlay from
+//! Arrangement MidiClips. Compiles on both desktop and wasm32-freestanding.
 const std = @import("std");
-const c = @import("c");
-const decode = @import("../audio/decode.zig");
+const builtin = @import("builtin");
+const is_wasm = builtin.cpu.arch.isWasm();
+const c = if (is_wasm) struct {} else @import("c");
+const decode = if (is_wasm) struct {} else @import("../audio/decode.zig");
 const palette = @import("palette.zig");
-const pack_mod = @import("pack.zig");
+const pack_mod = if (is_wasm) struct {} else @import("pack.zig");
+const types = @import("types.zig");
 const drums_bank = @import("drums_bank");
 
-const VirtualFile = pack_mod.VirtualFile;
-const UniPack = pack_mod.UniPack;
-const SoundEntry = pack_mod.SoundEntry;
-const LedEvent = pack_mod.LedEvent;
-const LedAnimation = pack_mod.LedAnimation;
-const AutoPlayEvent = pack_mod.AutoPlayEvent;
+pub const VirtualFile = types.VirtualFile;
+const UniPack = if (is_wasm) void else pack_mod.UniPack;
+const SoundEntry = types.SoundEntry;
+const LedEvent = types.LedEvent;
+const LedAnimation = types.LedAnimation;
+const AutoPlayEvent = types.AutoPlayEvent;
 
 pub const ConvertSummary = struct {
     chains: u8,
@@ -24,6 +27,12 @@ pub const ConvertSummary = struct {
     led_pads: usize,
     led_events: usize,
     auto_events: usize,
+};
+
+pub const ConvertBufferResult = struct {
+    title: []u8,
+    zip: []u8,
+    summary: ConvertSummary,
 };
 
 pub fn hasAls(files: []const VirtualFile) bool {
@@ -135,6 +144,33 @@ pub fn loadFromFiles(
     return pk;
 }
 
+/// Converts in-memory Ableton project files into a portable UniPack .zip byte buffer (pure Zig, WASM-safe).
+pub fn convertFilesToUniPackZipBuffer(
+    gpa: std.mem.Allocator,
+    files: []const VirtualFile,
+    fallback_title: []const u8,
+) !ConvertBufferResult {
+    var work_arena = std.heap.ArenaAllocator.init(gpa);
+    defer work_arena.deinit();
+    const wa = work_arena.allocator();
+
+    const proj = try buildProject(wa, files, fallback_title);
+
+    var zw: ZipBufWriter = .{};
+    defer zw.deinit(gpa);
+    const summary = try emitUniPackEntries(wa, &proj, &zw, gpa);
+    try zw.finish(gpa);
+
+    const title_copy = try gpa.dupe(u8, proj.title);
+    errdefer gpa.free(title_copy);
+    const zip_bytes = try zw.buf.toOwnedSlice(gpa);
+    return .{
+        .title = title_copy,
+        .zip = zip_bytes,
+        .summary = summary,
+    };
+}
+
 /// Converts an Ableton project (.zip, folder, or .als file) into a standard UniPack .zip archive.
 pub fn convertToUniPackZip(
     gpa: std.mem.Allocator,
@@ -158,13 +194,126 @@ pub fn convertToUniPackZip(
     if (c.archive_write_open_filename(arch, out_z.ptr) != c.ARCHIVE_OK) return error.ArchiveOpenFailed;
     defer _ = c.archive_write_close(arch);
 
+    var sink = LibArchiveSink{ .arch = arch };
+    return try emitUniPackEntries(wa, &proj, &sink, wa);
+}
+
+const LibArchiveSink = struct {
+    arch: *c.archive,
+    fn writeEntry(self: *LibArchiveSink, a: std.mem.Allocator, rel_path: []const u8, data: []const u8) !void {
+        try writeZipEntry(a, self.arch, rel_path, data);
+    }
+};
+
+const ZipBufWriter = struct {
+    const EntryMeta = struct {
+        name: []u8,
+        crc: u32,
+        size: u32,
+        offset: u32,
+    };
+
+    buf: std.ArrayList(u8) = .empty,
+    entries: std.ArrayList(EntryMeta) = .empty,
+
+    fn deinit(self: *ZipBufWriter, a: std.mem.Allocator) void {
+        for (self.entries.items) |e| a.free(e.name);
+        self.entries.deinit(a);
+        self.buf.deinit(a);
+    }
+
+    fn writeEntry(self: *ZipBufWriter, a: std.mem.Allocator, rel_path: []const u8, data: []const u8) !void {
+        if (rel_path.len > std.math.maxInt(u16)) return error.NameTooLong;
+        if (self.buf.items.len > std.math.maxInt(u32) or data.len > std.math.maxInt(u32)) return error.ZipTooLarge;
+        const offset: u32 = @intCast(self.buf.items.len);
+        const size: u32 = @intCast(data.len);
+        const crc: u32 = std.hash.Crc32.hash(data);
+        const name_len: u16 = @intCast(rel_path.len);
+
+        // Local file header (STORE, UTF-8 flag bit 11 = 0x0800)
+        var hdr: [30]u8 = undefined;
+        std.mem.writeInt(u32, hdr[0..4], 0x04034b50, .little);
+        std.mem.writeInt(u16, hdr[4..6], 20, .little);
+        std.mem.writeInt(u16, hdr[6..8], 0x0800, .little);
+        std.mem.writeInt(u16, hdr[8..10], 0, .little); // STORE
+        std.mem.writeInt(u16, hdr[10..12], 0, .little);
+        std.mem.writeInt(u16, hdr[12..14], 0x5421, .little);
+        std.mem.writeInt(u32, hdr[14..18], crc, .little);
+        std.mem.writeInt(u32, hdr[18..22], size, .little);
+        std.mem.writeInt(u32, hdr[22..26], size, .little);
+        std.mem.writeInt(u16, hdr[26..28], name_len, .little);
+        std.mem.writeInt(u16, hdr[28..30], 0, .little);
+
+        try self.buf.ensureUnusedCapacity(a, hdr.len + rel_path.len + data.len);
+        self.buf.appendSliceAssumeCapacity(&hdr);
+        self.buf.appendSliceAssumeCapacity(rel_path);
+        self.buf.appendSliceAssumeCapacity(data);
+
+        const name_copy = try a.dupe(u8, rel_path);
+        errdefer a.free(name_copy);
+        try self.entries.append(a, .{
+            .name = name_copy,
+            .crc = crc,
+            .size = size,
+            .offset = offset,
+        });
+    }
+
+    fn finish(self: *ZipBufWriter, a: std.mem.Allocator) !void {
+        if (self.buf.items.len > std.math.maxInt(u32)) return error.ZipTooLarge;
+        const cd_offset: u32 = @intCast(self.buf.items.len);
+        for (self.entries.items) |e| {
+            const name_len: u16 = @intCast(e.name.len);
+            var ch: [46]u8 = undefined;
+            std.mem.writeInt(u32, ch[0..4], 0x02014b50, .little);
+            std.mem.writeInt(u16, ch[4..6], 20, .little);
+            std.mem.writeInt(u16, ch[6..8], 20, .little);
+            std.mem.writeInt(u16, ch[8..10], 0x0800, .little);
+            std.mem.writeInt(u16, ch[10..12], 0, .little); // STORE
+            std.mem.writeInt(u16, ch[12..14], 0, .little);
+            std.mem.writeInt(u16, ch[14..16], 0x5421, .little);
+            std.mem.writeInt(u32, ch[16..20], e.crc, .little);
+            std.mem.writeInt(u32, ch[20..24], e.size, .little);
+            std.mem.writeInt(u32, ch[24..28], e.size, .little);
+            std.mem.writeInt(u16, ch[28..30], name_len, .little);
+            std.mem.writeInt(u16, ch[30..32], 0, .little);
+            std.mem.writeInt(u16, ch[32..34], 0, .little);
+            std.mem.writeInt(u16, ch[34..36], 0, .little);
+            std.mem.writeInt(u16, ch[36..38], 0, .little);
+            std.mem.writeInt(u32, ch[38..42], 0, .little);
+            std.mem.writeInt(u32, ch[42..46], e.offset, .little);
+            try self.buf.ensureUnusedCapacity(a, ch.len + e.name.len);
+            self.buf.appendSliceAssumeCapacity(&ch);
+            self.buf.appendSliceAssumeCapacity(e.name);
+        }
+        const cd_size: u32 = @intCast(self.buf.items.len - cd_offset);
+        const count: u16 = @intCast(@min(self.entries.items.len, std.math.maxInt(u16)));
+        var eocd: [22]u8 = undefined;
+        std.mem.writeInt(u32, eocd[0..4], 0x06054b50, .little);
+        std.mem.writeInt(u16, eocd[4..6], 0, .little);
+        std.mem.writeInt(u16, eocd[6..8], 0, .little);
+        std.mem.writeInt(u16, eocd[8..10], count, .little);
+        std.mem.writeInt(u16, eocd[10..12], count, .little);
+        std.mem.writeInt(u32, eocd[12..16], cd_size, .little);
+        std.mem.writeInt(u32, eocd[16..20], cd_offset, .little);
+        std.mem.writeInt(u16, eocd[20..22], 0, .little);
+        try self.buf.appendSlice(a, &eocd);
+    }
+};
+
+fn emitUniPackEntries(
+    wa: std.mem.Allocator,
+    proj: *const ConvertedProject,
+    sink: anytype,
+    sink_alloc: std.mem.Allocator,
+) !ConvertSummary {
     // 1. info
     const info_txt = try std.fmt.allocPrint(
         wa,
         "title={s}\nproducerName={s}\nbuttonX=8\nbuttonY=8\nchain={d}\nsquareButton=true\nlandscape=true\n",
         .{ proj.title, proj.producer, proj.chain_count },
     );
-    try writeZipEntry(wa, arch, "info", info_txt);
+    try sink.writeEntry(sink_alloc, "info", info_txt);
 
     // 2. sounds/* + keySound
     var sound_names = try wa.alloc([]const u8, proj.raw_sounds.len);
@@ -173,7 +322,7 @@ pub fn convertToUniPackZip(
         const sname = try std.fmt.allocPrint(wa, "s_{d:0>4}{s}", .{ i, ext });
         sound_names[i] = sname;
         const zpath = try std.fmt.allocPrint(wa, "sounds/{s}", .{sname});
-        try writeZipEntry(wa, arch, zpath, rs.bytes);
+        try sink.writeEntry(sink_alloc, zpath, rs.bytes);
     }
 
     var ks_buf: std.ArrayList(u8) = .empty;
@@ -192,7 +341,7 @@ pub fn convertToUniPackZip(
             }
         }
     }
-    try writeZipEntry(wa, arch, "keySound", ks_buf.items);
+    try sink.writeEntry(sink_alloc, "keySound", ks_buf.items);
 
     // 3. keyLED/*
     var led_pads: usize = 0;
@@ -217,7 +366,7 @@ pub fn convertToUniPackZip(
                             },
                             .pad_off => |off| try lb.print(wa, "off {d} {d}\n", .{ off.row + 1, off.col + 1 }),
                             .ring_on => |on| {
-                                if (on.idx == pack_mod.logo_led_index) {
+                                if (on.idx == types.logo_led_index) {
                                     if (on.color == palette.argbOf(on.velocity)) {
                                         try lb.print(wa, "on l auto {d}\n", .{on.velocity});
                                     } else {
@@ -232,7 +381,7 @@ pub fn convertToUniPackZip(
                                 }
                             },
                             .ring_off => |idx| {
-                                if (idx == pack_mod.logo_led_index) {
+                                if (idx == types.logo_led_index) {
                                     try lb.appendSlice(wa, "off l\n");
                                 } else {
                                     try lb.print(wa, "off mc {d}\n", .{idx + 1});
@@ -246,7 +395,7 @@ pub fn convertToUniPackZip(
                         try std.fmt.allocPrint(wa, "keyLED/{d} {d} {d} 1", .{ ch + 1, r + 1, col + 1 })
                     else
                         try std.fmt.allocPrint(wa, "keyLED/{d} {d} {d} 1 {c}", .{ ch + 1, r + 1, col + 1, @as(u8, 'a') + @as(u8, @intCast(@min(k, 25))) });
-                    try writeZipEntry(wa, arch, lpath, lb.items);
+                    try sink.writeEntry(sink_alloc, lpath, lb.items);
                 }
             }
         }
@@ -263,7 +412,7 @@ pub fn convertToUniPackZip(
                 .delay => |d| try ab.print(wa, "delay {d}\n", .{d}),
             }
         }
-        try writeZipEntry(wa, arch, "autoPlay", ab.items);
+        try sink.writeEntry(sink_alloc, "autoPlay", ab.items);
     }
 
     return .{
@@ -311,6 +460,10 @@ const PadMapping = struct {
     rel_path: []const u8,
     file_name: []const u8,
     loop: bool,
+    sample_start: u64 = 0,
+    sample_end: u64 = 0,
+    default_duration: u64 = 0,
+    default_sample_rate: u32 = 0,
 };
 
 const MidiDevKind = enum { rack, pitcher, chord, velocity, note_length, arp, random, mx_ext };
@@ -377,9 +530,11 @@ const LightMode = enum(u8) { static, pulse, flash };
 const LightRootRack = struct {
     rack_idx: u32,
     mode: LightMode = .static,
+    legacy_rg: bool = false,
 };
 
 const ParsedAls = struct {
+    major_version: u16 = 5,
     tempo: f64 = 120.0,
     pad_samples: std.ArrayList(PadMapping) = .empty,
     midi_racks: std.ArrayList(MidiRack) = .empty,
@@ -403,21 +558,27 @@ fn buildProject(a: std.mem.Allocator, files: []const VirtualFile, fallback_title
     };
 
     const layout = detectLayout(parsed.pad_samples.items);
-    const chain_count: u8 = @intCast(std.math.clamp(@as(usize, parsed.max_chain_seen) + 1, 1, pack_mod.max_chains));
+    const chain_count: u8 = @intCast(std.math.clamp(@as(usize, parsed.max_chain_seen) + 1, 1, types.max_chains));
     const total_cells = @as(usize, chain_count) * 64;
 
-    // Index all audio files in the zip/folder by normalized lowercase path and basename
+    // Index all audio files in the zip/folder by normalized lowercase path and unique basename
     var path_index = std.StringHashMapUnmanaged(VirtualFile).empty;
-    var base_index = std.StringHashMapUnmanaged(VirtualFile).empty;
+    var base_index = std.StringHashMapUnmanaged(?VirtualFile).empty;
     for (files) |f| {
         if (!isAudioFile(f.rel_path)) continue;
         const low_full = try lowerAlloc(a, f.rel_path);
         try path_index.put(a, low_full, f);
         const low_base = try lowerAlloc(a, basenameOf(f.rel_path));
-        if (!base_index.contains(low_base)) try base_index.put(a, low_base, f);
+        const gop = try base_index.getOrPut(a, low_base);
+        if (!gop.found_existing) {
+            gop.value_ptr.* = f;
+        } else {
+            // Multiple files share this basename: mark ambiguous so fallback won't pick the wrong one.
+            gop.value_ptr.* = null;
+        }
     }
 
-    // Deduplicate resolved sound files -> sample_id
+    // Deduplicate resolved (and optionally trimmed) sound files -> sample_id
     var raw_sounds: std.ArrayList(VirtualFile) = .empty;
     var file_to_id = std.StringHashMapUnmanaged(u32).empty;
 
@@ -428,13 +589,23 @@ fn buildProject(a: std.mem.Allocator, files: []const VirtualFile, fallback_title
 
     for (parsed.pad_samples.items) |pm| {
         const xy = midiNoteToXY(layout, pm.midi_note) orelse continue;
-        const vf = resolveSampleFile(a, pm.rel_path, pm.file_name, files, &path_index, &base_index) orelse {
+        const orig_vf = resolveSampleFile(a, pm.rel_path, pm.file_name, files, &path_index, &base_index) orelse {
             try missing_samples.append(a, pm);
             continue;
         };
 
-        const key = try lowerAlloc(a, vf.rel_path);
+        const trimmed = shouldTrimSample(pm, orig_vf);
+        const low_path = try lowerAlloc(a, orig_vf.rel_path);
+        const key = if (trimmed)
+            try std.fmt.allocPrint(a, "{s}#{d}..{d}", .{ low_path, pm.sample_start, pm.sample_end })
+        else
+            low_path;
+
         const sample_id: u32 = if (file_to_id.get(key)) |existing| existing else blk: {
+            const vf = if (trimmed)
+                (try trimSampleFile(a, orig_vf, pm.sample_start, pm.sample_end, pm.default_sample_rate)) orelse orig_vf
+            else
+                orig_vf;
             const id: u32 = @intCast(raw_sounds.items.len);
             try raw_sounds.append(a, vf);
             try file_to_id.put(a, key, id);
@@ -447,11 +618,21 @@ fn buildProject(a: std.mem.Allocator, files: []const VirtualFile, fallback_title
         var ch: u8 = c_min;
         while (ch <= c_max) : (ch += 1) {
             const ci = (@as(usize, ch) * 8 + xy[0]) * 8 + xy[1];
-            try sound_lists[ci].append(a, .{
-                .sample_id = sample_id,
-                .loop = if (pm.loop) -1 else 0,
-                .wormhole = null,
-            });
+            // Deduplicate identical sample layers in the same cell (e.g. accidental duplicate branches).
+            var dup = false;
+            for (sound_lists[ci].items) |prev| {
+                if (prev.sample_id == sample_id) {
+                    dup = true;
+                    break;
+                }
+            }
+            if (!dup) {
+                try sound_lists[ci].append(a, .{
+                    .sample_id = sample_id,
+                    .loop = if (pm.loop) -1 else 0,
+                    .wormhole = null,
+                });
+            }
         }
     }
 
@@ -460,7 +641,7 @@ fn buildProject(a: std.mem.Allocator, files: []const VirtualFile, fallback_title
     for (missing_samples.items) |pm| {
         const xy = midiNoteToXY(layout, pm.midi_note) orelse continue;
         const asset = drums_bank.lookup(pm.rel_path, pm.file_name) orelse {
-            std.log.warn("ableton: missing sample \"{s}/{s}\" (not in project)", .{ pm.rel_path, pm.file_name });
+            if (!is_wasm) std.log.warn("ableton: missing sample \"{s}/{s}\" (not in project)", .{ pm.rel_path, pm.file_name });
             continue;
         };
         const vf: VirtualFile = .{ .rel_path = asset.name, .bytes = asset.bytes };
@@ -469,7 +650,7 @@ fn buildProject(a: std.mem.Allocator, files: []const VirtualFile, fallback_title
             const new_id: u32 = @intCast(raw_sounds.items.len);
             try raw_sounds.append(a, vf);
             try file_to_id.put(a, key, new_id);
-            std.log.warn("ableton: missing factory drum \"{s}/{s}\" -> bundled \"{s}\"", .{ pm.rel_path, pm.file_name, vf.rel_path });
+            if (!is_wasm) std.log.warn("ableton: missing factory drum \"{s}/{s}\" -> bundled \"{s}\"", .{ pm.rel_path, pm.file_name, vf.rel_path });
             break :blk new_id;
         };
 
@@ -487,6 +668,27 @@ fn buildProject(a: std.mem.Allocator, files: []const VirtualFile, fallback_title
                     .wormhole = null,
                 });
             }
+        }
+    }
+
+    // Pass 3: Ableton InstrumentRacks play multiple branches in the same chain simultaneously,
+    // whereas UniPack keySound cycles multiple lines per pad. Mix multi-layer WAV cells into one WAV.
+    for (0..total_cells) |ci| {
+        if (sound_lists[ci].items.len <= 1) continue;
+        if (try mixWavLayers(a, raw_sounds.items, sound_lists[ci].items)) |mixed_wav| {
+            var any_loop = false;
+            for (sound_lists[ci].items) |se| if (se.loop < 0) {
+                any_loop = true;
+            };
+            const mixed_id: u32 = @intCast(raw_sounds.items.len);
+            const lname = try std.fmt.allocPrint(a, "layer_{d}.wav", .{ci});
+            try raw_sounds.append(a, .{ .rel_path = lname, .bytes = mixed_wav });
+            sound_lists[ci].clearRetainingCapacity();
+            try sound_lists[ci].append(a, .{
+                .sample_id = mixed_id,
+                .loop = if (any_loop) -1 else 0,
+                .wormhole = null,
+            });
         }
     }
 
@@ -537,6 +739,7 @@ const Tag = enum(u8) {
     master_track,
     tempo,
     midi_track,
+    ableton,
     return_track,
     drum_group_device,
     drum_branch,
@@ -546,7 +749,11 @@ const Tag = enum(u8) {
     branch_selector_range,
     original_simpler,
     multi_sampler,
+    sample_start,
+    sample_end,
     sample_ref,
+    default_duration,
+    default_sample_rate,
     file_ref,
     relative_path,
     relative_path_element,
@@ -619,6 +826,7 @@ const Tag = enum(u8) {
 };
 
 const tag_map = std.StaticStringMap(Tag).initComptime(.{
+    .{ "Ableton", .ableton },
     .{ "MasterTrack", .master_track },
     .{ "MainTrack", .master_track },
     .{ "Tempo", .tempo },
@@ -632,7 +840,11 @@ const tag_map = std.StaticStringMap(Tag).initComptime(.{
     .{ "BranchSelectorRange", .branch_selector_range },
     .{ "OriginalSimpler", .original_simpler },
     .{ "MultiSampler", .multi_sampler },
+    .{ "SampleStart", .sample_start },
+    .{ "SampleEnd", .sample_end },
     .{ "SampleRef", .sample_ref },
+    .{ "DefaultDuration", .default_duration },
+    .{ "DefaultSampleRate", .default_sample_rate },
     .{ "FileRef", .file_ref },
     .{ "RelativePath", .relative_path },
     .{ "RelativePathElement", .relative_path_element },
@@ -720,10 +932,12 @@ const ParserState = struct {
     // Sample extraction state (DrumGroup -> DrumBranch -> [InstrumentBranch] -> Simpler)
     in_drum_group: bool = false,
     in_drum_branch: bool = false,
+    drum_branch_muted: bool = false,
     drum_branch_sample_start: usize = 0,
     cur_drum_note: u8 = 0,
     has_drum_note: bool = false,
     in_inst_branch: bool = false,
+    inst_branch_muted: bool = false,
     inst_branch_sample_start: usize = 0,
     inst_sel_min: u8 = 0,
     inst_sel_max: u8 = 0,
@@ -732,6 +946,10 @@ const ParserState = struct {
     in_sample_file_ref: bool = false,
     simpler_on: bool = true,
     simpler_loop: bool = false,
+    simpler_start: u64 = 0,
+    simpler_end: u64 = 0,
+    simpler_default_dur: u64 = 0,
+    simpler_default_sr: u32 = 0,
     simpler_rel: std.ArrayList(u8) = .empty,
     simpler_name: []const u8 = "",
 
@@ -744,6 +962,7 @@ const ParserState = struct {
     active_dev_idx: usize = 0,
     active_dev_tag: Tag = .other,
     track_light_mode: LightMode = .static,
+    track_legacy_rg: bool = false,
     track_root_racks: std.ArrayList(u32) = .empty,
 
     // Arrangement MidiClip state
@@ -770,12 +989,18 @@ const ParserState = struct {
         const grand = s.grandTag();
 
         switch (tag) {
+            .ableton => {
+                if (attrInt(attrs, "MajorVersion")) |mv| {
+                    if (mv > 0 and mv <= 65535) s.out.major_version = @intCast(mv);
+                }
+            },
             .master_track => s.in_master = true,
             .return_track => s.in_return_track = true,
             .midi_track => {
                 s.in_midi_track = true;
                 s.track_has_drum = false;
                 s.track_light_mode = .static;
+                s.track_legacy_rg = false;
                 s.track_root_racks.clearRetainingCapacity();
                 s.track_clips.clearRetainingCapacity();
             },
@@ -788,6 +1013,7 @@ const ParserState = struct {
             .drum_branch => {
                 if (s.in_drum_group) {
                     s.in_drum_branch = true;
+                    s.drum_branch_muted = false;
                     s.drum_branch_sample_start = s.out.pad_samples.items.len;
                     s.has_drum_note = false;
                     s.cur_drum_note = 0;
@@ -811,6 +1037,7 @@ const ParserState = struct {
             .instrument_branch => {
                 if (s.in_midi_track and !s.in_return_track) {
                     s.in_inst_branch = true;
+                    s.inst_branch_muted = false;
                     s.inst_branch_sample_start = s.out.pad_samples.items.len;
                     s.inst_sel_min = 0;
                     s.inst_sel_max = 0;
@@ -823,12 +1050,38 @@ const ParserState = struct {
                     s.in_sample_file_ref = false;
                     s.simpler_on = true;
                     s.simpler_loop = false;
+                    s.simpler_start = 0;
+                    s.simpler_end = 0;
+                    s.simpler_default_dur = 0;
+                    s.simpler_default_sr = 0;
                     s.simpler_rel.clearRetainingCapacity();
                     s.simpler_name = "";
                 }
             },
+            .sample_start => {
+                if (s.in_simpler) {
+                    if (attrU64(attrs, "Value")) |v| s.simpler_start = v;
+                }
+            },
+            .sample_end => {
+                if (s.in_simpler) {
+                    if (attrU64(attrs, "Value")) |v| s.simpler_end = v;
+                }
+            },
             .sample_ref => {
                 if (s.in_simpler) s.in_sample_ref = true;
+            },
+            .default_duration => {
+                if (s.in_sample_ref) {
+                    if (attrU64(attrs, "Value")) |v| s.simpler_default_dur = v;
+                }
+            },
+            .default_sample_rate => {
+                if (s.in_sample_ref) {
+                    if (attrU64(attrs, "Value")) |v| {
+                        if (v >= 8000 and v <= 384000) s.simpler_default_sr = @intCast(v);
+                    }
+                }
             },
             .file_ref => {
                 if (s.in_sample_ref and parent == .sample_ref) s.in_sample_file_ref = true;
@@ -968,14 +1221,19 @@ const ParserState = struct {
             .target => {
                 if (s.in_midi_track and !s.in_return_track and parent == .midi_output_routing) {
                     if (attrStr(attrs, "Value")) |v| {
+                        var ch_val: i32 = 0;
                         if (std.mem.lastIndexOfScalar(u8, v, '/')) |slash| {
                             if (std.fmt.parseInt(i32, v[slash + 1 ..], 10)) |ch| {
+                                ch_val = ch;
                                 if (ch == 2 or ch == 7) {
                                     s.track_light_mode = .pulse; // Ch. 3 (Programmer) / Ch. 8 (User 1)
                                 } else if (ch == 1 or ch == 6) {
                                     s.track_light_mode = .flash; // Ch. 2 (Programmer) / Ch. 7 (User 1)
                                 }
                             } else |_| {}
+                        }
+                        if (isLegacyLaunchpadTarget(v, ch_val, s.out.major_version)) {
+                            s.track_legacy_rg = true;
                         }
                     }
                 }
@@ -987,12 +1245,12 @@ const ParserState = struct {
                     if (parent == .branch_selector_range) {
                         if (s.in_inst_branch and grand == .instrument_branch) {
                             if (tag == .min) s.inst_sel_min = v else s.inst_sel_max = v;
-                            if (v < pack_mod.max_chains and v > s.out.max_chain_seen) s.out.max_chain_seen = v;
+                            if (v < types.max_chains and v > s.out.max_chain_seen) s.out.max_chain_seen = v;
                         } else if (s.branch_depth > 0 and grand == .midi_effect_branch) {
                             const b = &s.out.midi_branches.items[s.branch_stack[s.branch_depth - 1]];
                             b.has_sel = true;
                             if (tag == .min) b.sel_min = v else b.sel_max = v;
-                            if (v < pack_mod.max_chains and v > s.out.max_chain_seen) s.out.max_chain_seen = v;
+                            if (v < types.max_chains and v > s.out.max_chain_seen) s.out.max_chain_seen = v;
                         }
                     } else if (parent == .key_range and s.branch_depth > 0) {
                         const b = &s.out.midi_branches.items[s.branch_stack[s.branch_depth - 1]];
@@ -1035,7 +1293,11 @@ const ParserState = struct {
                     } else {
                         // Light tracks have MIDI effect racks without DrumGroupDevice
                         for (s.track_root_racks.items) |ridx| {
-                            s.out.light_root_racks.append(s.a, .{ .rack_idx = ridx, .mode = s.track_light_mode }) catch {};
+                            s.out.light_root_racks.append(s.a, .{
+                                .rack_idx = ridx,
+                                .mode = s.track_light_mode,
+                                .legacy_rg = s.track_legacy_rg,
+                            }) catch {};
                         }
                     }
                 }
@@ -1045,7 +1307,7 @@ const ParserState = struct {
             .drum_group_device => s.in_drum_group = false,
             .drum_branch => {
                 if (s.in_drum_branch) {
-                    if (s.has_drum_note) {
+                    if (s.has_drum_note and !s.drum_branch_muted) {
                         for (s.out.pad_samples.items[s.drum_branch_sample_start..]) |*pm| {
                             pm.midi_note = s.cur_drum_note;
                         }
@@ -1054,16 +1316,22 @@ const ParserState = struct {
                     }
                 }
                 s.in_drum_branch = false;
+                s.drum_branch_muted = false;
                 s.has_drum_note = false;
             },
             .instrument_branch => {
                 if (s.in_inst_branch) {
-                    for (s.out.pad_samples.items[s.inst_branch_sample_start..]) |*pm| {
-                        pm.sel_min = s.inst_sel_min;
-                        pm.sel_max = s.inst_sel_max;
+                    if (s.inst_branch_muted) {
+                        s.out.pad_samples.items.len = s.inst_branch_sample_start;
+                    } else {
+                        for (s.out.pad_samples.items[s.inst_branch_sample_start..]) |*pm| {
+                            pm.sel_min = s.inst_sel_min;
+                            pm.sel_max = s.inst_sel_max;
+                        }
                     }
                 }
                 s.in_inst_branch = false;
+                s.inst_branch_muted = false;
             },
             .file_ref => s.in_sample_file_ref = false,
             .sample_ref => {
@@ -1080,6 +1348,10 @@ const ParserState = struct {
                         .rel_path = rel_copy,
                         .file_name = s.simpler_name,
                         .loop = s.simpler_loop,
+                        .sample_start = s.simpler_start,
+                        .sample_end = s.simpler_end,
+                        .default_duration = s.simpler_default_dur,
+                        .default_sample_rate = s.simpler_default_sr,
                     }) catch {};
                 }
                 s.in_simpler = false;
@@ -1138,9 +1410,16 @@ const ParserState = struct {
             }
             return;
         }
-        if (parent == .speaker and grand == .mixer_device and s.branch_depth > 0) {
+        if (parent == .speaker and grand == .mixer_device) {
             if (attrStr(attrs, "Value")) |v| {
-                s.out.midi_branches.items[s.branch_stack[s.branch_depth - 1]].muted = std.mem.eql(u8, v, "false");
+                const is_muted = std.mem.eql(u8, v, "false");
+                if (s.branch_depth > 0) {
+                    s.out.midi_branches.items[s.branch_stack[s.branch_depth - 1]].muted = is_muted;
+                } else if (s.in_inst_branch) {
+                    s.inst_branch_muted = is_muted;
+                } else if (s.in_drum_branch) {
+                    s.drum_branch_muted = is_muted;
+                }
             }
             return;
         }
@@ -1293,23 +1572,15 @@ fn parseAlsGzipStream(a: std.mem.Allocator, als_bytes: []const u8, out: *ParsedA
     defer carry.deinit(a);
 
     if (als_bytes.len >= 2 and als_bytes[0] == 0x1f and als_bytes[1] == 0x8b) {
-        const arch = c.archive_read_new() orelse return error.ArchiveInitFailed;
-        defer _ = c.archive_read_free(arch);
-        _ = c.archive_read_support_filter_gzip(arch);
-        _ = c.archive_read_support_format_raw(arch);
-        if (c.archive_read_open_memory(arch, @constCast(als_bytes.ptr), als_bytes.len) != c.ARCHIVE_OK) {
-            return error.AlsDecompressFailed;
-        }
-        var entry: ?*c.archive_entry = null;
-        if (c.archive_read_next_header(arch, &entry) != c.ARCHIVE_OK) {
-            return error.AlsDecompressFailed;
-        }
-        var chunk: [65536]u8 = undefined;
+        var in_reader: std.Io.Reader = .fixed(als_bytes);
+        const window_buf = try a.alloc(u8, std.compress.flate.max_window_len);
+        defer a.free(window_buf);
+        var decomp = std.compress.flate.Decompress.init(&in_reader, .gzip, window_buf);
+        var chunk: [32768]u8 = undefined;
         while (true) {
-            const n = c.archive_read_data(arch, &chunk, chunk.len);
-            if (n < 0) return error.AlsDecompressFailed;
+            const n = decomp.reader.readSliceShort(&chunk) catch return error.AlsDecompressFailed;
             if (n == 0) break;
-            try feedXmlChunk(a, &st, &carry, chunk[0..@intCast(n)]);
+            try feedXmlChunk(a, &st, &carry, chunk[0..n]);
         }
     } else {
         try feedXmlChunk(a, &st, &carry, als_bytes);
@@ -1390,6 +1661,14 @@ fn attrInt(attrs: []const u8, key: []const u8) ?i32 {
 fn attrFloat(attrs: []const u8, key: []const u8) ?f64 {
     const s = attrStr(attrs, key) orelse return null;
     return std.fmt.parseFloat(f64, s) catch null;
+}
+
+fn attrU64(attrs: []const u8, key: []const u8) ?u64 {
+    const s = attrStr(attrs, key) orelse return null;
+    if (std.fmt.parseInt(u64, s, 10)) |v| return v else |_| {}
+    const f = std.fmt.parseFloat(f64, s) catch return null;
+    if (!std.math.isFinite(f) or f < 0.0) return null;
+    return @intFromFloat(@round(f));
 }
 
 fn appendUnescaped(a: std.mem.Allocator, dst: *std.ArrayList(u8), s: []const u8) !void {
@@ -1810,6 +2089,8 @@ fn simulatePadLightsPress(
         try evalRack(a, parsed, midiext, root_rack.rack_idx, beat_ms, chain, &seed, &out_notes, 0, press_idx, cycle_len);
         for (out_notes.items) |sn| {
             if (sn.vel == 0) continue;
+            const vel: u8 = if (root_rack.legacy_rg) launchpadSToRgbVelocity(sn.vel) else sn.vel;
+            if (vel == 0) continue;
             const slot: u8 = if (midiNoteToXY(layout, sn.note)) |xy|
                 xy[0] * 8 + xy[1]
             else if (midiNoteToRing(layout, sn.note)) |ridx|
@@ -1819,13 +2100,13 @@ fn simulatePadLightsPress(
             const t_on: u32 = @intFromFloat(std.math.clamp(@round(sn.start_ms), 0.0, 300000.0));
             const dur_clamped = std.math.clamp(sn.dur_ms, 5.0, 60000.0);
             const t_off: u32 = @intFromFloat(std.math.clamp(@round(sn.start_ms + dur_clamped), @as(f64, @floatFromInt(t_on + 1)), 360000.0));
-            const base_col = palette.argbOf(sn.vel);
+            const base_col = palette.argbOf(vel);
 
             if (root_rack.mode == .pulse and dur_clamped >= 300.0) {
                 // Launchpad hardware pulsing: smooth breathing cycle over 2 beats (20%..100% brightness).
                 const period_ms = @max(beat_ms * 2.0, 400.0);
                 const step_ms = @max(period_ms / 16.0, @max(65.0, dur_clamped / 240.0));
-                try trans.append(a, .{ .t_ms = t_on, .kind = .on, .slot = slot, .vel = sn.vel, .color = base_col });
+                try trans.append(a, .{ .t_ms = t_on, .kind = .on, .slot = slot, .vel = vel, .color = base_col });
                 var dt: f64 = step_ms;
                 while (dt + 15.0 < dur_clamped) : (dt += step_ms) {
                     const phase = (dt / period_ms) * (2.0 * std.math.pi);
@@ -1845,12 +2126,12 @@ fn simulatePadLightsPress(
                     const s_t: u32 = @intFromFloat(@round(@as(f64, @floatFromInt(t_on)) + dt));
                     const e_t: u32 = @min(t_off, @as(u32, @intFromFloat(@round(@as(f64, @floatFromInt(t_on)) + dt + half))));
                     if (e_t > s_t) {
-                        try trans.append(a, .{ .t_ms = s_t, .kind = .on, .slot = slot, .vel = sn.vel, .color = base_col });
+                        try trans.append(a, .{ .t_ms = s_t, .kind = .on, .slot = slot, .vel = vel, .color = base_col });
                         try trans.append(a, .{ .t_ms = e_t, .kind = .off, .slot = slot, .vel = 0, .color = 0 });
                     }
                 }
             } else {
-                try trans.append(a, .{ .t_ms = t_on, .kind = .on, .slot = slot, .vel = sn.vel, .color = base_col });
+                try trans.append(a, .{ .t_ms = t_on, .kind = .on, .slot = slot, .vel = vel, .color = base_col });
                 try trans.append(a, .{ .t_ms = t_off, .kind = .off, .slot = slot, .vel = 0, .color = 0 });
             }
         }
@@ -1867,7 +2148,11 @@ fn simulatePadLightsPress(
     }.lessThan);
 
     var events: std.ArrayList(LedEvent) = .empty;
-    var active: [64 + pack_mod.logo_led_index + 1]u16 = @splat(0);
+    const total_slots = 64 + types.logo_led_index + 1;
+    var active: [total_slots]u16 = @splat(0);
+    var last_on_t: [total_slots]u32 = @splat(std.math.maxInt(u32));
+    var last_on_col: [total_slots]u32 = @splat(0);
+    var last_on_vel: [total_slots]u8 = @splat(0);
     var cur_t: u32 = 0;
 
     for (trans.items) |tr| {
@@ -1875,11 +2160,16 @@ fn simulatePadLightsPress(
         switch (tr.kind) {
             .on, .update => {
                 if (tr.kind == .update and active[cell] == 0) continue;
+                const already_same = (tr.kind == .on and active[cell] > 0 and last_on_t[cell] == tr.t_ms and last_on_vel[cell] == tr.vel and last_on_col[cell] == tr.color);
+                if (tr.kind == .on) active[cell] +|= 1;
+                if (already_same) continue;
                 if (tr.t_ms > cur_t) {
                     try events.append(a, .{ .delay = tr.t_ms - cur_t });
                     cur_t = tr.t_ms;
                 }
-                if (tr.kind == .on) active[cell] +|= 1;
+                last_on_t[cell] = tr.t_ms;
+                last_on_col[cell] = tr.color;
+                last_on_vel[cell] = tr.vel;
                 if (tr.slot < 64) {
                     try events.append(a, .{ .pad_on = .{
                         .row = tr.slot / 8,
@@ -1898,6 +2188,7 @@ fn simulatePadLightsPress(
             .off => {
                 if (active[cell] > 0) active[cell] -= 1;
                 if (active[cell] == 0) {
+                    last_on_t[cell] = std.math.maxInt(u32);
                     if (tr.t_ms > cur_t) {
                         try events.append(a, .{ .delay = tr.t_ms - cur_t });
                         cur_t = tr.t_ms;
@@ -2047,19 +2338,19 @@ fn evalDeviceChain(
                 if (!ve.on) continue;
                 const lo: u8 = ve.lowest;
                 const hi: u8 = @intCast(@min(@as(u16, 127), @as(u16, ve.lowest) + ve.range));
+                // Live 9/10 uses Operation (0=Clip, 1=Gate, 2=Fixed); some schemas/tools use Mode (2=Fixed).
+                const is_fixed = ve.mode == 2 or ve.operation == 2;
+                const is_gate = !is_fixed and (ve.mode == 1 or ve.operation == 1);
                 for (cur.items) |sn| {
-                    if (ve.mode == 1 and (sn.vel < lo or sn.vel > hi)) continue; // Gate
+                    if (is_gate and (sn.vel < lo or sn.vel > hi)) continue;
                     var copy = sn;
-                    copy.vel = switch (ve.mode) {
-                        2 => ve.max_out, // Fixed
-                        0, 1 => blk: { // Clip / Gate linear scaling [lo..hi] -> [min_out..max_out]
-                            const clamped = std.math.clamp(sn.vel, lo, hi);
-                            if (hi <= lo) break :blk ve.max_out;
-                            const t = @as(f64, @floatFromInt(clamped - lo)) / @as(f64, @floatFromInt(hi - lo));
-                            const out_f = @as(f64, @floatFromInt(ve.min_out)) + t * (@as(f64, @floatFromInt(ve.max_out)) - @as(f64, @floatFromInt(ve.min_out)));
-                            break :blk @intFromFloat(std.math.clamp(@round(out_f), 0.0, 127.0));
-                        },
-                        else => sn.vel,
+                    copy.vel = if (is_fixed) ve.max_out else blk: {
+                        // Clip / Gate linear scaling [lo..hi] -> [min_out..max_out]
+                        const clamped = std.math.clamp(sn.vel, lo, hi);
+                        if (hi <= lo) break :blk ve.max_out;
+                        const t = @as(f64, @floatFromInt(clamped - lo)) / @as(f64, @floatFromInt(hi - lo));
+                        const out_f = @as(f64, @floatFromInt(ve.min_out)) + t * (@as(f64, @floatFromInt(ve.max_out)) - @as(f64, @floatFromInt(ve.min_out)));
+                        break :blk @intFromFloat(std.math.clamp(@round(out_f), 0.0, 127.0));
                     };
                     try next.append(a, copy);
                 }
@@ -2477,13 +2768,13 @@ pub fn midiNoteToRing(layout: NoteLayout, note: u8) ?u8 {
             if (note >= 100 and note <= 107) return 8 + (note - 100); // Right (top -> bottom): mc 9..16
             if (note >= 108 and note <= 115) return 16 + (note - 108); // Bottom (right -> left): mc 17..24
             if (note >= 116 and note <= 123) return 24 + (note - 116); // Left (bottom -> top): mc 25..32
-            if (note == 27) return pack_mod.logo_led_index; // Logo: l
+            if (note == 27) return types.logo_led_index; // Logo: l
             return null;
         },
         .programmer => {
             if (note >= 91 and note <= 98) return note - 91; // Top (left -> right): mc 1..8
             if (note >= 104 and note <= 111) return note - 104; // Top (MK2/S CC/note alt): mc 1..8
-            if (note == 99) return pack_mod.logo_led_index; // Logo: l
+            if (note == 99) return types.logo_led_index; // Logo: l
             if (note >= 1 and note <= 8) return 16 + (8 - note); // Bottom (right -> left): mc 17..24
             // Right column: 89, 79, 69, 59, 49, 39, 29, 19 -> 8..15
             if (note >= 19 and note <= 89 and note % 10 == 9) return 8 + (8 - note / 10);
@@ -2494,13 +2785,382 @@ pub fn midiNoteToRing(layout: NoteLayout, note: u8) ?u8 {
     }
 }
 
+/// Detects 2-color Red/Green Launchpad MIDI output targets (Launchpad S, Launchpad Mini MK1/MK2,
+/// or Live 8/9 plain Launchpad MK1 on Ch. 1). RGB models (MK2, Pro, X, Mini MK3) return false.
+fn isLegacyLaunchpadTarget(target: []const u8, ch: i32, major_version: u16) bool {
+    if (!containsIgnoreCase(target, "launchpad")) return false;
+    if (containsIgnoreCase(target, "mk2") or
+        containsIgnoreCase(target, "mk3") or
+        containsIgnoreCase(target, "pro") or
+        containsIgnoreCase(target, "rgb") or
+        containsIgnoreCase(target, "cfw") or
+        containsIgnoreCase(target, "lpx") or
+        containsIgnoreCase(target, "launchpad x") or
+        containsIgnoreCase(target, "launchpad_x") or
+        containsIgnoreCase(target, "apollo"))
+    {
+        return false;
+    }
+    if (containsIgnoreCase(target, "launchpad s") or
+        containsIgnoreCase(target, "launchpad_s") or
+        containsIgnoreCase(target, "launchpad mini") or
+        containsIgnoreCase(target, "launchpad_mini"))
+    {
+        return true;
+    }
+    return ch == 0 and major_version <= 4;
+}
+
+/// Maps Launchpad S / Mini MK1/MK2 2-bit R/G velocity (`r = v & 3`, `g = (v >> 4) & 3`)
+/// to its closest Novation RGB Launchpad velocity (0 = off).
+pub fn launchpadSToRgbVelocity(vel: u8) u8 {
+    const r: usize = vel & 0x03;
+    const g: usize = (vel >> 4) & 0x03;
+    // Indexed [g][r] in 0..3 x 0..3 matching palette.zig Novation RGB entries.
+    const table = [4][4]u8{
+        .{ 0, 7, 6, 5 }, // g=0: off, dim red, med red, bright red
+        .{ 23, 15, 10, 9 }, // g=1: dim green, dim yellow, med orange, bright orange
+        .{ 22, 18, 14, 12 }, // g=2: med green, med lime, med yellow, warm amber
+        .{ 21, 17, 16, 13 }, // g=3: bright green, bright lime, yellow-green, bright yellow
+    };
+    return table[g][r];
+}
+
+// ============================================================================
+// Pure-Zig Sample Trimming (Simpler SampleStart/SampleEnd) & Layer Mixing
+// ============================================================================
+
+const WavSlice = struct {
+    audio_fmt: u16,
+    channels: u16,
+    sample_rate: u32,
+    block_align: u16,
+    bits_per_sample: u16,
+    data: []const u8,
+    total_frames: u64,
+};
+
+fn parseWav(bytes: []const u8) ?WavSlice {
+    if (bytes.len < 44) return null;
+    if (!std.mem.eql(u8, bytes[0..4], "RIFF") or !std.mem.eql(u8, bytes[8..12], "WAVE")) return null;
+    var pos: usize = 12;
+    var audio_fmt: u16 = 0;
+    var channels: u16 = 0;
+    var sample_rate: u32 = 0;
+    var block_align: u16 = 0;
+    var bits_per_sample: u16 = 0;
+    var has_fmt = false;
+    var data_slice: ?[]const u8 = null;
+
+    while (pos + 8 <= bytes.len) {
+        const cid = bytes[pos .. pos + 4];
+        const csz: usize = std.mem.readInt(u32, bytes[pos + 4 ..][0..4], .little);
+        const cstart = pos + 8;
+        const cend = @min(bytes.len, cstart + csz);
+        if (std.mem.eql(u8, cid, "fmt ") and cend - cstart >= 16) {
+            audio_fmt = std.mem.readInt(u16, bytes[cstart..][0..2], .little);
+            channels = std.mem.readInt(u16, bytes[cstart + 2 ..][0..2], .little);
+            sample_rate = std.mem.readInt(u32, bytes[cstart + 4 ..][0..4], .little);
+            block_align = std.mem.readInt(u16, bytes[cstart + 12 ..][0..2], .little);
+            bits_per_sample = std.mem.readInt(u16, bytes[cstart + 14 ..][0..2], .little);
+            if (audio_fmt == 0xFFFE and cend - cstart >= 40) {
+                audio_fmt = std.mem.readInt(u16, bytes[cstart + 24 ..][0..2], .little);
+            }
+            has_fmt = true;
+        } else if (std.mem.eql(u8, cid, "data")) {
+            data_slice = bytes[cstart..cend];
+        }
+        const adv = csz + (csz & 1);
+        if (cstart + adv <= pos) break;
+        pos = cstart + adv;
+    }
+
+    if (!has_fmt or data_slice == null or channels == 0 or block_align == 0 or sample_rate == 0) return null;
+    if (audio_fmt != 1 and audio_fmt != 3) return null;
+    const d = data_slice.?;
+    return .{
+        .audio_fmt = audio_fmt,
+        .channels = channels,
+        .sample_rate = sample_rate,
+        .block_align = block_align,
+        .bits_per_sample = bits_per_sample,
+        .data = d,
+        .total_frames = d.len / block_align,
+    };
+}
+
+fn shouldTrimSample(pm: PadMapping, vf: VirtualFile) bool {
+    if (pm.sample_start > 0) return true;
+    if (pm.sample_end == 0) return false;
+    if (pm.default_duration > 0 and pm.sample_end + 64 < pm.default_duration) return true;
+    if (endsWithIgnoreCase(vf.rel_path, ".wav")) {
+        if (parseWav(vf.bytes)) |w| {
+            if (pm.sample_end + 64 < w.total_frames) return true;
+        }
+    }
+    return false;
+}
+
+fn trimSampleFile(
+    a: std.mem.Allocator,
+    vf: VirtualFile,
+    start_frame: u64,
+    end_frame: u64,
+    default_sr: u32,
+) !?VirtualFile {
+    if (endsWithIgnoreCase(vf.rel_path, ".wav")) {
+        if (try trimWavBytes(a, vf.bytes, start_frame, end_frame)) |out| {
+            return .{ .rel_path = vf.rel_path, .bytes = out };
+        }
+        return null;
+    }
+
+    // Desktop: sample-accurate decode + slice -> 16-bit stereo PCM WAV for non-WAV formats (.mp3/.ogg/.flac/.aif)
+    if (!is_wasm) {
+        const sr: u32 = if (default_sr >= 8000 and default_sr <= 192000) default_sr else 44100;
+        if (decode.decode(a, vf.bytes, vf.rel_path, sr)) |samp| {
+            defer a.free(samp.data);
+            const total_frames: u64 = samp.data.len / 2;
+            if (total_frames > 0) {
+                const s = @min(start_frame, total_frames);
+                const e = if (end_frame > s) @min(end_frame, total_frames) else total_frames;
+                if (e > s and (s > 0 or e + 64 < total_frames)) {
+                    const pcm_slice = samp.data[@intCast(s * 2)..@intCast(e * 2)];
+                    const wav_bytes = try encodeStereoPcm16Wav(a, pcm_slice, sr);
+                    const stem = stemOfPath(vf.rel_path);
+                    const new_name = try std.fmt.allocPrint(a, "{s}_trim.wav", .{stem});
+                    return .{ .rel_path = new_name, .bytes = wav_bytes };
+                }
+            }
+        } else |_| {}
+    }
+
+    // WASM (or fallback): pure-Zig MPEG frame-boundary trimmer for MP3
+    if (endsWithIgnoreCase(vf.rel_path, ".mp3")) {
+        if (try trimMp3Bytes(a, vf.bytes, start_frame, end_frame)) |out| {
+            return .{ .rel_path = vf.rel_path, .bytes = out };
+        }
+    }
+    return null;
+}
+
+fn trimWavBytes(a: std.mem.Allocator, bytes: []const u8, start_frame: u64, end_frame: u64) !?[]u8 {
+    const w = parseWav(bytes) orelse return null;
+    if (w.total_frames == 0) return null;
+    const s = @min(start_frame, w.total_frames);
+    const e = if (end_frame > s) @min(end_frame, w.total_frames) else w.total_frames;
+    if (e <= s) return null;
+    if (s == 0 and e + 64 >= w.total_frames) return null;
+
+    const byte_start: usize = @intCast(s * w.block_align);
+    const byte_end: usize = @intCast(e * w.block_align);
+    if (byte_end > w.data.len or byte_end <= byte_start) return null;
+    const payload = w.data[byte_start..byte_end];
+    if (payload.len > std.math.maxInt(u32) - 44) return null;
+
+    const out = try a.alloc(u8, 44 + payload.len);
+    const data_sz: u32 = @intCast(payload.len);
+    const riff_sz: u32 = 36 + data_sz;
+    const byte_rate: u32 = w.sample_rate * w.block_align;
+    @memcpy(out[0..4], "RIFF");
+    std.mem.writeInt(u32, out[4..8], riff_sz, .little);
+    @memcpy(out[8..12], "WAVE");
+    @memcpy(out[12..16], "fmt ");
+    std.mem.writeInt(u32, out[16..20], 16, .little);
+    std.mem.writeInt(u16, out[20..22], w.audio_fmt, .little);
+    std.mem.writeInt(u16, out[22..24], w.channels, .little);
+    std.mem.writeInt(u32, out[24..28], w.sample_rate, .little);
+    std.mem.writeInt(u32, out[28..32], byte_rate, .little);
+    std.mem.writeInt(u16, out[32..34], w.block_align, .little);
+    std.mem.writeInt(u16, out[34..36], w.bits_per_sample, .little);
+    @memcpy(out[36..40], "data");
+    std.mem.writeInt(u32, out[40..44], data_sz, .little);
+    @memcpy(out[44..], payload);
+    return out;
+}
+
+fn trimMp3Bytes(a: std.mem.Allocator, bytes: []const u8, start_frame: u64, end_frame: u64) !?[]u8 {
+    if (bytes.len < 16) return null;
+    var pos: usize = 0;
+    if (std.mem.eql(u8, bytes[0..3], "ID3") and bytes.len >= 10) {
+        const id3_sz: usize = (@as(usize, bytes[6] & 0x7F) << 21) |
+            (@as(usize, bytes[7] & 0x7F) << 14) |
+            (@as(usize, bytes[8] & 0x7F) << 7) |
+            @as(usize, bytes[9] & 0x7F);
+        pos = @min(bytes.len, 10 + id3_sz);
+    }
+
+    const br_v1_l3 = [16]u32{ 0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 0 };
+    const br_v2_l3 = [16]u32{ 0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160, 0 };
+    const sr_v1 = [4]u32{ 44100, 48000, 32000, 0 };
+    const sr_v2 = [4]u32{ 22050, 24000, 16000, 0 };
+    const sr_v25 = [4]u32{ 11025, 12000, 8000, 0 };
+
+    var cur_sample: u64 = 0;
+    var slice_start: ?usize = null;
+    var slice_end: usize = bytes.len;
+    var skipped_xing = false;
+
+    while (pos + 4 <= bytes.len) {
+        if (bytes[pos] != 0xFF or (bytes[pos + 1] & 0xE0) != 0xE0) {
+            pos += 1;
+            continue;
+        }
+        const ver = (bytes[pos + 1] >> 3) & 0x03;
+        const layer = (bytes[pos + 1] >> 1) & 0x03;
+        const br_i = (bytes[pos + 2] >> 4) & 0x0F;
+        const sr_i = (bytes[pos + 2] >> 2) & 0x03;
+        const pad: usize = (bytes[pos + 2] >> 1) & 0x01;
+        if (ver == 1 or layer != 1 or br_i == 0 or br_i == 15 or sr_i == 3) {
+            pos += 1;
+            continue;
+        }
+        const br: u32 = (if (ver == 3) br_v1_l3[br_i] else br_v2_l3[br_i]) * 1000;
+        const sr: u32 = switch (ver) {
+            3 => sr_v1[sr_i],
+            2 => sr_v2[sr_i],
+            0 => sr_v25[sr_i],
+            else => 0,
+        };
+        if (br == 0 or sr == 0) {
+            pos += 1;
+            continue;
+        }
+        const spf: u64 = if (ver == 3) 1152 else 576;
+        const fsz: usize = @intCast(((if (ver == 3) @as(u64, 144) else @as(u64, 72)) * br) / sr + pad);
+        if (fsz < 4 or pos + fsz > bytes.len) break;
+
+        if (!skipped_xing and cur_sample == 0) {
+            skipped_xing = true;
+            const frame = bytes[pos .. pos + fsz];
+            if (std.mem.indexOf(u8, frame, "Xing") != null or std.mem.indexOf(u8, frame, "Info") != null) {
+                pos += fsz;
+                continue;
+            }
+        }
+
+        if (slice_start == null and cur_sample + spf > start_frame) {
+            slice_start = pos;
+        }
+        cur_sample += spf;
+        pos += fsz;
+        if (end_frame > start_frame and cur_sample >= end_frame) {
+            slice_end = pos;
+            break;
+        }
+    }
+
+    const s_off = slice_start orelse return null;
+    if (slice_end <= s_off or slice_end > bytes.len) return null;
+    return try a.dupe(u8, bytes[s_off..slice_end]);
+}
+
+fn encodeStereoPcm16Wav(a: std.mem.Allocator, stereo_f32: []const f32, sample_rate: u32) ![]u8 {
+    const data_sz: u32 = @intCast(stereo_f32.len * 2);
+    const out = try a.alloc(u8, 44 + data_sz);
+    @memcpy(out[0..4], "RIFF");
+    std.mem.writeInt(u32, out[4..8], 36 + data_sz, .little);
+    @memcpy(out[8..12], "WAVE");
+    @memcpy(out[12..16], "fmt ");
+    std.mem.writeInt(u32, out[16..20], 16, .little);
+    std.mem.writeInt(u16, out[20..22], 1, .little); // PCM
+    std.mem.writeInt(u16, out[22..24], 2, .little); // stereo
+    std.mem.writeInt(u32, out[24..28], sample_rate, .little);
+    std.mem.writeInt(u32, out[28..32], sample_rate * 4, .little);
+    std.mem.writeInt(u16, out[32..34], 4, .little);
+    std.mem.writeInt(u16, out[34..36], 16, .little);
+    @memcpy(out[36..40], "data");
+    std.mem.writeInt(u32, out[40..44], data_sz, .little);
+    for (stereo_f32, 0..) |s, i| {
+        const clamped = std.math.clamp(s, -1.0, 1.0);
+        const v: i16 = @intFromFloat(@round(clamped * 32767.0));
+        std.mem.writeInt(i16, out[44 + i * 2 ..][0..2], v, .little);
+    }
+    return out;
+}
+
+fn readWavSampleF32(w: WavSlice, frame: usize, ch: usize) f32 {
+    const c_idx = if (ch < w.channels) ch else 0;
+    const bps_bytes: usize = w.bits_per_sample / 8;
+    const off = frame * w.block_align + c_idx * bps_bytes;
+    if (off + bps_bytes > w.data.len) return 0.0;
+    if (w.audio_fmt == 3 and w.bits_per_sample == 32) {
+        return @bitCast(std.mem.readInt(u32, w.data[off..][0..4], .little));
+    }
+    return switch (w.bits_per_sample) {
+        8 => (@as(f32, @floatFromInt(w.data[off])) - 128.0) / 128.0,
+        16 => @as(f32, @floatFromInt(std.mem.readInt(i16, w.data[off..][0..2], .little))) / 32768.0,
+        24 => blk: {
+            const b0: i32 = w.data[off];
+            const b1: i32 = w.data[off + 1];
+            const b2: i32 = @as(i8, @bitCast(w.data[off + 2]));
+            const val: i32 = (b2 << 16) | (b1 << 8) | b0;
+            break :blk @as(f32, @floatFromInt(val)) / 8388608.0;
+        },
+        32 => @as(f32, @floatFromInt(std.mem.readInt(i32, w.data[off..][0..4], .little))) / 2147483648.0,
+        else => 0.0,
+    };
+}
+
+fn mixWavLayers(a: std.mem.Allocator, raw_sounds: []const VirtualFile, entries: []const SoundEntry) !?[]u8 {
+    if (entries.len <= 1 or entries.len > 16) return null;
+    var wavs: [16]WavSlice = undefined;
+    var sample_rate: u32 = 0;
+    var max_frames: usize = 0;
+
+    for (entries, 0..) |se, i| {
+        const w = parseWav(raw_sounds[se.sample_id].bytes) orelse return null;
+        if (w.bits_per_sample != 8 and w.bits_per_sample != 16 and w.bits_per_sample != 24 and w.bits_per_sample != 32) return null;
+        if (i == 0) {
+            sample_rate = w.sample_rate;
+        } else if (w.sample_rate != sample_rate) {
+            return null;
+        }
+        if (w.total_frames > 44100 * 60) return null; // safety cap: 60s
+        wavs[i] = w;
+        max_frames = @max(max_frames, @as(usize, @intCast(w.total_frames)));
+    }
+    if (max_frames == 0) return null;
+
+    const mix = try a.alloc(f32, max_frames * 2);
+    defer a.free(mix);
+    @memset(mix, 0.0);
+
+    var peak: f32 = 0.0;
+    for (wavs[0..entries.len]) |w| {
+        const n: usize = @intCast(w.total_frames);
+        for (0..n) |f| {
+            const l = readWavSampleF32(w, f, 0);
+            const r = readWavSampleF32(w, f, 1);
+            mix[f * 2] += l;
+            mix[f * 2 + 1] += r;
+            peak = @max(peak, @max(@abs(mix[f * 2]), @abs(mix[f * 2 + 1])));
+        }
+    }
+    if (peak > 0.98) {
+        const scale = 0.98 / peak;
+        for (mix) |*s| s.* *= scale;
+    }
+    return try encodeStereoPcm16Wav(a, mix, sample_rate);
+}
+
+fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
+    if (needle.len == 0) return true;
+    if (haystack.len < needle.len) return false;
+    var i: usize = 0;
+    while (i + needle.len <= haystack.len) : (i += 1) {
+        if (std.ascii.eqlIgnoreCase(haystack[i .. i + needle.len], needle)) return true;
+    }
+    return false;
+}
+
 fn resolveSampleFile(
     a: std.mem.Allocator,
     rel_path: []const u8,
     file_name: []const u8,
     files: []const VirtualFile,
     path_index: *const std.StringHashMapUnmanaged(VirtualFile),
-    base_index: *const std.StringHashMapUnmanaged(VirtualFile),
+    base_index: *const std.StringHashMapUnmanaged(?VirtualFile),
 ) ?VirtualFile {
     // Build normalized candidate tail: e.g. "page 1/2.wav"
     var candidate_buf: std.ArrayList(u8) = .empty;
@@ -2537,9 +3197,10 @@ fn resolveSampleFile(
         }
     }
 
-    // Fallback: unique basename match only when no directory hint was present
-    if (std.mem.indexOfScalar(u8, cand, '/') == null) {
-        if (base_index.get(cand)) |vf| return vf;
+    // Fallback: unambiguous unique basename match (rescues moved sample dirs in older projects)
+    const cand_base = basenameOf(cand);
+    if (base_index.get(cand_base)) |maybe_vf| {
+        if (maybe_vf) |vf| return vf;
     }
     return null;
 }
@@ -2885,4 +3546,103 @@ test "ableton keytrack backfill, heart wrapper+velocity scaling, outer inst rack
     try std.testing.expectEqual(@as(u8, 7), mx_anims[1][0].pad_on.row);
     try std.testing.expectEqual(@as(u8, 1), mx_anims[1][0].pad_on.col);
     try std.testing.expectEqual(@as(u8, 55), mx_anims[1][0].pad_on.velocity);
+}
+
+test "ableton live 9 legacy launchpad S colors, simpler trim, layer mix, and pure-zig zip" {
+    try std.testing.expectEqual(@as(u8, 5), launchpadSToRgbVelocity(75)); // Bright Red
+    try std.testing.expectEqual(@as(u8, 21), launchpadSToRgbVelocity(48)); // Bright Green
+    try std.testing.expectEqual(@as(u8, 13), launchpadSToRgbVelocity(127)); // Bright Yellow
+    try std.testing.expectEqual(@as(u8, 17), launchpadSToRgbVelocity(125)); // Bright Lime
+    try std.testing.expectEqual(@as(u8, 9), launchpadSToRgbVelocity(31)); // Bright Orange
+    try std.testing.expectEqual(@as(u8, 0), launchpadSToRgbVelocity(12)); // Off
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Build two tiny valid 16-bit stereo 44.1kHz WAVs (1000 frames and 400 frames)
+    const pcm_a = try a.alloc(f32, 1000 * 2);
+    for (pcm_a, 0..) |*s, i| s.* = if (i % 2 == 0) 0.4 else -0.4;
+    const wav_a = try encodeStereoPcm16Wav(a, pcm_a, 44100);
+
+    const pcm_b = try a.alloc(f32, 400 * 2);
+    @memset(pcm_b, 0.3);
+    const wav_b = try encodeStereoPcm16Wav(a, pcm_b, 44100);
+
+    const als =
+        \\<Ableton MajorVersion="4" MinorVersion="9.0_305" Creator="Ableton Live 9.1.1">
+        \\  <LiveSet>
+        \\    <Tracks>
+        \\      <MidiTrack>
+        \\        <DrumGroupDevice><Branches>
+        \\          <DrumBranch>
+        \\            <InstrumentGroupDevice><Branches>
+        \\              <InstrumentBranch>
+        \\                <OriginalSimpler>
+        \\                  <On><Manual Value="true" /></On>
+        \\                  <MultiSamplePart>
+        \\                    <SampleStart Value="200" /><SampleEnd Value="500" />
+        \\                    <SampleRef><DefaultDuration Value="1000" /><DefaultSampleRate Value="44100" /><FileRef><Name Value="long.wav" /></FileRef></SampleRef>
+        \\                  </MultiSamplePart>
+        \\                </OriginalSimpler>
+        \\                <BranchSelectorRange><Min Value="0" /><Max Value="0" /></BranchSelectorRange>
+        \\              </InstrumentBranch>
+        \\              <InstrumentBranch>
+        \\                <OriginalSimpler>
+        \\                  <On><Manual Value="true" /></On>
+        \\                  <MultiSamplePart>
+        \\                    <SampleStart Value="0" /><SampleEnd Value="400" />
+        \\                    <SampleRef><DefaultDuration Value="400" /><DefaultSampleRate Value="44100" /><FileRef><Name Value="layer.wav" /></FileRef></SampleRef>
+        \\                  </MultiSamplePart>
+        \\                </OriginalSimpler>
+        \\                <BranchSelectorRange><Min Value="0" /><Max Value="0" /></BranchSelectorRange>
+        \\              </InstrumentBranch>
+        \\            </Branches></InstrumentGroupDevice>
+        \\            <BranchInfo><ReceivingNote Value="92" /></BranchInfo>
+        \\          </DrumBranch>
+        \\        </Branches></DrumGroupDevice>
+        \\      </MidiTrack>
+        \\      <MidiTrack>
+        \\        <MidiOutputRouting><Target Value="MidiOut/External.Dev:Launchpad S/0" /></MidiOutputRouting>
+        \\        <MidiEffectGroupDevice><Branches>
+        \\          <MidiEffectBranch>
+        \\            <DeviceChain><MidiToMidiDeviceChain><Devices>
+        \\              <MidiVelocity><On><Manual Value="true" /></On><Mode><Manual Value="0" /></Mode><Operation><Manual Value="2" /></Operation><MaxOut><Manual Value="75" /></MaxOut></MidiVelocity>
+        \\            </Devices></MidiToMidiDeviceChain></DeviceChain>
+        \\            <BranchSelectorRange><Min Value="0" /><Max Value="0" /></BranchSelectorRange>
+        \\            <ZoneSettings><KeyRange><Min Value="36" /><Max Value="36" /></KeyRange></ZoneSettings>
+        \\          </MidiEffectBranch>
+        \\        </Branches></MidiEffectGroupDevice>
+        \\      </MidiTrack>
+        \\    </Tracks>
+        \\  </LiveSet>
+        \\</Ableton>
+    ;
+
+    const files = [_]VirtualFile{
+        .{ .rel_path = "Hello9.als", .bytes = als },
+        .{ .rel_path = "Samples/long.wav", .bytes = wav_a },
+        .{ .rel_path = "Samples/layer.wav", .bytes = wav_b },
+    };
+
+    const proj = try buildProject(a, &files, "Fallback");
+    // Trimmed long.wav (300 frames) + layer.wav (400 frames) mixed into 1 single layered WAV entry on pad (7,0)
+    try std.testing.expectEqual(@as(usize, 1), proj.sound_cells[7 * 8 + 0].len);
+    const mixed_id = proj.sound_cells[7 * 8 + 0][0].sample_id;
+    const mixed_wav = parseWav(proj.raw_sounds[mixed_id].bytes).?;
+    try std.testing.expectEqual(@as(u64, 400), mixed_wav.total_frames);
+
+    // Launchpad S velocity 75 (0x4B -> R=3,G=0) converted to RGB velocity 5 (Bright Red)
+    try std.testing.expectEqual(@as(usize, 1), proj.led_cells[7 * 8 + 0].len);
+    try std.testing.expectEqual(@as(u8, 5), proj.led_cells[7 * 8 + 0][0][0].pad_on.velocity);
+
+    // Pure-Zig ZIP buffer export
+    const res = try convertFilesToUniPackZipBuffer(std.testing.allocator, &files, "Fallback");
+    defer {
+        std.testing.allocator.free(res.title);
+        std.testing.allocator.free(res.zip);
+    }
+    try std.testing.expectEqualStrings("Hello9", res.title);
+    try std.testing.expect(res.zip.len > 64);
+    try std.testing.expectEqualStrings("PK\x03\x04", res.zip[0..4]);
 }

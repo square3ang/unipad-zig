@@ -117,4 +117,29 @@ pub fn build(b: *std.Build) void {
 
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = mod })).step);
+
+    // Pure-Zig WebAssembly Ableton -> UniPack converter (no libc / SDL / libarchive)
+    const wasm_target = b.resolveTargetQuery(.{
+        .cpu_arch = .wasm32,
+        .os_tag = .freestanding,
+    });
+    const wasm_mod = b.createModule(.{
+        .root_source_file = b.path("src/wasm_ableton.zig"),
+        .target = wasm_target,
+        .optimize = .ReleaseSmall,
+    });
+    wasm_mod.addAnonymousImport("drums_bank", .{ .root_source_file = b.path("assets/drums/drums.zig") });
+    const wasm_exe = b.addExecutable(.{
+        .name = "ableton-converter",
+        .root_module = wasm_mod,
+    });
+    wasm_exe.entry = .disabled;
+    wasm_exe.rdynamic = true;
+
+    const wasm_step = b.step("wasm", "Build WebAssembly Ableton -> UniPack converter");
+    const wasm_install = b.addInstallFileWithDir(wasm_exe.getEmittedBin(), .{ .custom = "web" }, "ableton-converter.wasm");
+    const wasm_copy_web = b.addUpdateSourceFiles();
+    wasm_copy_web.addCopyFileToSource(wasm_exe.getEmittedBin(), "web/ableton-converter.wasm");
+    wasm_step.dependOn(&wasm_install.step);
+    wasm_step.dependOn(&wasm_copy_web.step);
 }

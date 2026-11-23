@@ -71,7 +71,7 @@ pub const Out = struct {
         const r = c.snd_pcm_wait(o.pcm, 100);
         if (r < 0) {
             if (r == epipe) xrun.* = true;
-            if (c.snd_pcm_recover(o.pcm, r, 1) < 0) c.SDL_Delay(100);
+            if (c.snd_pcm_recover(o.pcm, r, 1) < 0) c.SDL_Delay(100) else c.SDL_Delay(1);
             return false;
         }
         return r > 0;
@@ -94,12 +94,13 @@ pub const Out = struct {
             }
             tries += 1;
             if (n == 0) {
-                _ = c.snd_pcm_wait(o.pcm, 20);
+                if (c.snd_pcm_wait(o.pcm, 20) <= 0) c.SDL_Delay(1);
                 continue;
             }
             const err: c_int = @intCast(n);
             if (err == epipe) xrun = true;
             if (c.snd_pcm_recover(o.pcm, err, 1) < 0) break;
+            if (tries >= 2) c.SDL_Delay(1);
         }
         return xrun;
     }

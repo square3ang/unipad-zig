@@ -238,10 +238,28 @@ pub const Engine = struct {
         return 0;
     }
 
+    fn onSigXcpu(_: std.os.linux.SIG) callconv(.c) void {
+        // Async-signal-safe: demote this RT thread to normal scheduling so RLIMIT_RTTIME never kills the process.
+        const normal: std.os.linux.sched_param = .{ .priority = 0 };
+        _ = std.os.linux.sched_setscheduler(0, .{ .mode = .NORMAL }, &normal);
+    }
+
     fn raiseAudioPriority() void {
         if (builtin.os.tag != .linux) return;
-        const rr: c_int = @backingInt(std.os.linux.SCHED.Mode.RR);
-        if (c.SDL_SetLinuxThreadPriorityAndPolicy(std.os.linux.gettid(), c.SDL_THREAD_PRIORITY_TIME_CRITICAL, rr)) return;
+        const linux = std.os.linux;
+        const act: linux.Sigaction = .{
+            .handler = .{ .handler = onSigXcpu },
+            .mask = linux.sigemptyset(),
+            .flags = linux.SA.RESTART,
+        };
+        _ = linux.sigaction(.XCPU, &act, null);
+
+        // Prefer direct sched_setscheduler when RLIMIT_RTPRIO allows it: avoids SDL/rtkit clamping RLIMIT_RTTIME to 100ms.
+        const param: linux.sched_param = .{ .priority = 20 };
+        if (linux.errno(linux.sched_setscheduler(0, .{ .mode = .RR, .RESET_ON_FORK = true }, &param)) == .SUCCESS) return;
+
+        const rr: c_int = @backingInt(linux.SCHED.Mode.RR);
+        if (c.SDL_SetLinuxThreadPriorityAndPolicy(linux.gettid(), c.SDL_THREAD_PRIORITY_TIME_CRITICAL, rr)) return;
         std.log.warn("audio thread stays non-realtime: {s}", .{std.mem.span(c.SDL_GetError())});
         _ = c.SDL_SetCurrentThreadPriority(c.SDL_THREAD_PRIORITY_TIME_CRITICAL);
     }
