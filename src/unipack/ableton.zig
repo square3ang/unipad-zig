@@ -457,6 +457,8 @@ const PadMapping = struct {
     midi_note: u8,
     sel_min: u8,
     sel_max: u8,
+    key_min: u8 = 0,
+    key_max: u8 = 127,
     rel_path: []const u8,
     file_name: []const u8,
     loop: bool,
@@ -582,7 +584,13 @@ fn buildProject(a: std.mem.Allocator, files: []const VirtualFile, fallback_title
     var raw_sounds: std.ArrayList(VirtualFile) = .empty;
     var file_to_id = std.StringHashMapUnmanaged(u32).empty;
 
-    var sound_lists = try a.alloc(std.ArrayList(SoundEntry), total_cells);
+    const CellLayer = struct {
+        entry: SoundEntry,
+        key_min: u8 = 0,
+        key_max: u8 = 127,
+    };
+
+    var sound_lists = try a.alloc(std.ArrayList(CellLayer), total_cells);
     for (sound_lists) |*l| l.* = .empty;
 
     var missing_samples: std.ArrayList(PadMapping) = .empty;
@@ -618,19 +626,23 @@ fn buildProject(a: std.mem.Allocator, files: []const VirtualFile, fallback_title
         var ch: u8 = c_min;
         while (ch <= c_max) : (ch += 1) {
             const ci = (@as(usize, ch) * 8 + xy[0]) * 8 + xy[1];
-            // Deduplicate identical sample layers in the same cell (e.g. accidental duplicate branches).
+            // Deduplicate identical sample in the same key-zone (e.g. accidental duplicate branches).
             var dup = false;
             for (sound_lists[ci].items) |prev| {
-                if (prev.sample_id == sample_id) {
+                if (prev.entry.sample_id == sample_id and prev.key_min == pm.key_min and prev.key_max == pm.key_max) {
                     dup = true;
                     break;
                 }
             }
             if (!dup) {
                 try sound_lists[ci].append(a, .{
-                    .sample_id = sample_id,
-                    .loop = if (pm.loop) -1 else 0,
-                    .wormhole = null,
+                    .entry = .{
+                        .sample_id = sample_id,
+                        .loop = if (pm.loop) -1 else 0,
+                        .wormhole = null,
+                    },
+                    .key_min = pm.key_min,
+                    .key_max = pm.key_max,
                 });
             }
         }
@@ -663,37 +675,85 @@ fn buildProject(a: std.mem.Allocator, files: []const VirtualFile, fallback_title
             // Only fill empty cells so we don't duplicate pads that already have a real bundled layer.
             if (sound_lists[ci].items.len == 0) {
                 try sound_lists[ci].append(a, .{
-                    .sample_id = sample_id,
-                    .loop = if (pm.loop) -1 else 0,
-                    .wormhole = null,
+                    .entry = .{
+                        .sample_id = sample_id,
+                        .loop = if (pm.loop) -1 else 0,
+                        .wormhole = null,
+                    },
+                    .key_min = pm.key_min,
+                    .key_max = pm.key_max,
                 });
             }
         }
     }
 
-    // Pass 3: Ableton InstrumentRacks play multiple branches in the same chain simultaneously,
-    // whereas UniPack keySound cycles multiple lines per pad. Mix multi-layer WAV cells into one WAV.
-    for (0..total_cells) |ci| {
-        if (sound_lists[ci].items.len <= 1) continue;
-        if (try mixWavLayers(a, raw_sounds.items, sound_lists[ci].items)) |mixed_wav| {
-            var any_loop = false;
-            for (sound_lists[ci].items) |se| if (se.loop < 0) {
-                any_loop = true;
-            };
-            const mixed_id: u32 = @intCast(raw_sounds.items.len);
-            const lname = try std.fmt.allocPrint(a, "layer_{d}.wav", .{ci});
-            try raw_sounds.append(a, .{ .rel_path = lname, .bytes = mixed_wav });
-            sound_lists[ci].clearRetainingCapacity();
-            try sound_lists[ci].append(a, .{
-                .sample_id = mixed_id,
-                .loop = if (any_loop) -1 else 0,
-                .wormhole = null,
-            });
-        }
-    }
-
+    // Pass 3: Partition each cell by overlapping KeyRange.
+    // - Overlapping KeyRanges (e.g. sibling InstrumentBranches all 0..127) play simultaneously -> mix WAVs into 1 entry.
+    // - Disjoint KeyRanges (e.g. MidiRandom Alternate 60..60, 61..61, ...) cycle sequentially -> keep separate keySound entries.
     const sound_cells = try a.alloc([]const SoundEntry, total_cells);
-    for (0..total_cells) |ci| sound_cells[ci] = sound_lists[ci].items;
+    var group_buf: std.ArrayList(SoundEntry) = .empty;
+    defer group_buf.deinit(a);
+    var used_buf: std.ArrayList(bool) = .empty;
+    defer used_buf.deinit(a);
+
+    for (0..total_cells) |ci| {
+        const layers = sound_lists[ci].items;
+        if (layers.len == 0) {
+            sound_cells[ci] = &.{};
+            continue;
+        }
+        if (layers.len == 1) {
+            const one = try a.alloc(SoundEntry, 1);
+            one[0] = layers[0].entry;
+            sound_cells[ci] = one;
+            continue;
+        }
+
+        used_buf.clearRetainingCapacity();
+        try used_buf.appendNTimes(a, false, layers.len);
+        var cell_out: std.ArrayList(SoundEntry) = .empty;
+
+        for (0..layers.len) |i| {
+            if (used_buf.items[i]) continue;
+            used_buf.items[i] = true;
+            group_buf.clearRetainingCapacity();
+            try group_buf.append(a, layers[i].entry);
+            var g_min = layers[i].key_min;
+            var g_max = layers[i].key_max;
+
+            for (i + 1..layers.len) |j| {
+                if (used_buf.items[j]) continue;
+                if (layers[j].key_min <= g_max and g_min <= layers[j].key_max) {
+                    used_buf.items[j] = true;
+                    g_min = @max(g_min, layers[j].key_min);
+                    g_max = @min(g_max, layers[j].key_max);
+                    try group_buf.append(a, layers[j].entry);
+                }
+            }
+
+            if (group_buf.items.len > 1) {
+                if (try mixWavLayers(a, raw_sounds.items, group_buf.items)) |mixed_wav| {
+                    var any_loop = false;
+                    for (group_buf.items) |se| if (se.loop < 0) {
+                        any_loop = true;
+                    };
+                    const mixed_id: u32 = @intCast(raw_sounds.items.len);
+                    const lname = try std.fmt.allocPrint(a, "layer_{d}_{d}.wav", .{ ci, i });
+                    try raw_sounds.append(a, .{ .rel_path = lname, .bytes = mixed_wav });
+                    try cell_out.append(a, .{
+                        .sample_id = mixed_id,
+                        .loop = if (any_loop) -1 else 0,
+                        .wormhole = null,
+                    });
+                } else {
+                    try cell_out.appendSlice(a, group_buf.items);
+                }
+            } else {
+                try cell_out.append(a, group_buf.items[0]);
+            }
+        }
+        sound_cells[ci] = cell_out.items;
+    }
 
     // Simulate MIDI Effect Rack lightshows (including MIDI Extension 0save + .mid and MidiRandom multi-press)
     const led_cells = try a.alloc([]const []const LedEvent, total_cells);
@@ -916,6 +976,15 @@ const tag_map = std.StaticStringMap(Tag).initComptime(.{
     .{ "Manual", .manual },
 });
 
+const InstBranchFrame = struct {
+    sample_start: usize = 0,
+    sel_min: u8 = 0,
+    sel_max: u8 = 0,
+    key_min: u8 = 0,
+    key_max: u8 = 127,
+    muted: bool = false,
+};
+
 const ParserState = struct {
     a: std.mem.Allocator,
     out: *ParsedAls,
@@ -929,18 +998,15 @@ const ParserState = struct {
     in_return_track: bool = false,
     track_has_drum: bool = false,
 
-    // Sample extraction state (DrumGroup -> DrumBranch -> [InstrumentBranch] -> Simpler)
+    // Sample extraction state (DrumGroup -> DrumBranch -> [InstrumentBranch...] -> Simpler)
     in_drum_group: bool = false,
     in_drum_branch: bool = false,
     drum_branch_muted: bool = false,
     drum_branch_sample_start: usize = 0,
     cur_drum_note: u8 = 0,
     has_drum_note: bool = false,
-    in_inst_branch: bool = false,
-    inst_branch_muted: bool = false,
-    inst_branch_sample_start: usize = 0,
-    inst_sel_min: u8 = 0,
-    inst_sel_max: u8 = 0,
+    inst_stack: [8]InstBranchFrame = @splat(.{}),
+    inst_depth: usize = 0,
     in_simpler: bool = false,
     in_sample_ref: bool = false,
     in_sample_file_ref: bool = false,
@@ -1017,10 +1083,6 @@ const ParserState = struct {
                     s.drum_branch_sample_start = s.out.pad_samples.items.len;
                     s.has_drum_note = false;
                     s.cur_drum_note = 0;
-                    if (!s.in_inst_branch) {
-                        s.inst_sel_min = 0;
-                        s.inst_sel_max = 0;
-                    }
                 }
             },
             .receiving_note => {
@@ -1035,12 +1097,11 @@ const ParserState = struct {
                 }
             },
             .instrument_branch => {
-                if (s.in_midi_track and !s.in_return_track) {
-                    s.in_inst_branch = true;
-                    s.inst_branch_muted = false;
-                    s.inst_branch_sample_start = s.out.pad_samples.items.len;
-                    s.inst_sel_min = 0;
-                    s.inst_sel_max = 0;
+                if (s.in_midi_track and !s.in_return_track and s.inst_depth < s.inst_stack.len) {
+                    s.inst_stack[s.inst_depth] = .{
+                        .sample_start = s.out.pad_samples.items.len,
+                    };
+                    s.inst_depth += 1;
                 }
             },
             .original_simpler, .multi_sampler => {
@@ -1243,18 +1304,24 @@ const ParserState = struct {
                 if (attrInt(attrs, "Value")) |iv| {
                     const v: u8 = @intCast(std.math.clamp(iv, 0, 127));
                     if (parent == .branch_selector_range) {
-                        if (s.in_inst_branch and grand == .instrument_branch) {
-                            if (tag == .min) s.inst_sel_min = v else s.inst_sel_max = v;
-                            if (v < types.max_chains and v > s.out.max_chain_seen) s.out.max_chain_seen = v;
+                        if (s.inst_depth > 0 and grand == .instrument_branch) {
+                            const f = &s.inst_stack[s.inst_depth - 1];
+                            if (tag == .min) f.sel_min = v else f.sel_max = v;
+                            if (s.inst_depth == 1 and v < types.max_chains and v > s.out.max_chain_seen) s.out.max_chain_seen = v;
                         } else if (s.branch_depth > 0 and grand == .midi_effect_branch) {
                             const b = &s.out.midi_branches.items[s.branch_stack[s.branch_depth - 1]];
                             b.has_sel = true;
                             if (tag == .min) b.sel_min = v else b.sel_max = v;
                             if (v < types.max_chains and v > s.out.max_chain_seen) s.out.max_chain_seen = v;
                         }
-                    } else if (parent == .key_range and s.branch_depth > 0) {
-                        const b = &s.out.midi_branches.items[s.branch_stack[s.branch_depth - 1]];
-                        if (tag == .min) b.key_min = v else b.key_max = v;
+                    } else if (parent == .key_range and !s.in_simpler) {
+                        if (s.branch_depth > 0) {
+                            const b = &s.out.midi_branches.items[s.branch_stack[s.branch_depth - 1]];
+                            if (tag == .min) b.key_min = v else b.key_max = v;
+                        } else if (s.inst_depth > 0) {
+                            const f = &s.inst_stack[s.inst_depth - 1];
+                            if (tag == .min) f.key_min = v else f.key_max = v;
+                        }
                     }
                 }
             },
@@ -1320,18 +1387,23 @@ const ParserState = struct {
                 s.has_drum_note = false;
             },
             .instrument_branch => {
-                if (s.in_inst_branch) {
-                    if (s.inst_branch_muted) {
-                        s.out.pad_samples.items.len = s.inst_branch_sample_start;
+                if (s.inst_depth > 0) {
+                    s.inst_depth -= 1;
+                    const frame = s.inst_stack[s.inst_depth];
+                    if (frame.muted) {
+                        s.out.pad_samples.items.len = frame.sample_start;
                     } else {
-                        for (s.out.pad_samples.items[s.inst_branch_sample_start..]) |*pm| {
-                            pm.sel_min = s.inst_sel_min;
-                            pm.sel_max = s.inst_sel_max;
+                        for (s.out.pad_samples.items[frame.sample_start..]) |*pm| {
+                            // Outermost InstrumentBranch owns page/chain selector; all nesting levels intersect KeyRange.
+                            if (s.inst_depth == 0) {
+                                pm.sel_min = frame.sel_min;
+                                pm.sel_max = frame.sel_max;
+                            }
+                            pm.key_min = @max(pm.key_min, frame.key_min);
+                            pm.key_max = @min(pm.key_max, frame.key_max);
                         }
                     }
                 }
-                s.in_inst_branch = false;
-                s.inst_branch_muted = false;
             },
             .file_ref => s.in_sample_file_ref = false,
             .sample_ref => {
@@ -1341,10 +1413,12 @@ const ParserState = struct {
             .original_simpler, .multi_sampler => {
                 if (s.in_simpler and s.simpler_on and s.in_drum_branch and (s.simpler_name.len > 0 or s.simpler_rel.items.len > 0)) {
                     const rel_copy = s.a.dupe(u8, s.simpler_rel.items) catch "";
+                    const sel_min: u8 = if (s.inst_depth > 0) s.inst_stack[0].sel_min else 0;
+                    const sel_max: u8 = if (s.inst_depth > 0) s.inst_stack[0].sel_max else 0;
                     s.out.pad_samples.append(s.a, .{
                         .midi_note = s.cur_drum_note,
-                        .sel_min = s.inst_sel_min,
-                        .sel_max = s.inst_sel_max,
+                        .sel_min = sel_min,
+                        .sel_max = sel_max,
                         .rel_path = rel_copy,
                         .file_name = s.simpler_name,
                         .loop = s.simpler_loop,
@@ -1415,8 +1489,8 @@ const ParserState = struct {
                 const is_muted = std.mem.eql(u8, v, "false");
                 if (s.branch_depth > 0) {
                     s.out.midi_branches.items[s.branch_stack[s.branch_depth - 1]].muted = is_muted;
-                } else if (s.in_inst_branch) {
-                    s.inst_branch_muted = is_muted;
+                } else if (s.inst_depth > 0) {
+                    s.inst_stack[s.inst_depth - 1].muted = is_muted;
                 } else if (s.in_drum_branch) {
                     s.drum_branch_muted = is_muted;
                 }
@@ -3645,4 +3719,44 @@ test "ableton live 9 legacy launchpad S colors, simpler trim, layer mix, and pur
     try std.testing.expectEqualStrings("Hello9", res.title);
     try std.testing.expect(res.zip.len > 64);
     try std.testing.expectEqualStrings("PK\x03\x04", res.zip[0..4]);
+
+    // Disjoint KeyRange nested InstrumentBranches (MidiRandom multi-press) stay sequential, NOT mixed
+    const seq_als =
+        \\<Ableton MajorVersion="5">
+        \\  <LiveSet><Tracks><MidiTrack>
+        \\    <DrumGroupDevice><Branches>
+        \\      <DrumBranch>
+        \\        <InstrumentGroupDevice><Branches>
+        \\          <InstrumentBranch>
+        \\            <BranchSelectorRange><Min Value="1" /><Max Value="1" /></BranchSelectorRange>
+        \\            <ZoneSettings><KeyRange><Min Value="0" /><Max Value="127" /></KeyRange></ZoneSettings>
+        \\            <InstrumentGroupDevice><Branches>
+        \\              <InstrumentBranch>
+        \\                <BranchSelectorRange><Min Value="0" /><Max Value="0" /></BranchSelectorRange>
+        \\                <ZoneSettings><KeyRange><Min Value="60" /><Max Value="60" /></KeyRange></ZoneSettings>
+        \\                <OriginalSimpler><On><Manual Value="true" /></On><SampleRef><FileRef><Name Value="long.wav" /></FileRef></SampleRef></OriginalSimpler>
+        \\              </InstrumentBranch>
+        \\              <InstrumentBranch>
+        \\                <BranchSelectorRange><Min Value="0" /><Max Value="0" /></BranchSelectorRange>
+        \\                <ZoneSettings><KeyRange><Min Value="61" /><Max Value="61" /></KeyRange></ZoneSettings>
+        \\                <OriginalSimpler><On><Manual Value="true" /></On><SampleRef><FileRef><Name Value="layer.wav" /></FileRef></SampleRef></OriginalSimpler>
+        \\              </InstrumentBranch>
+        \\            </Branches></InstrumentGroupDevice>
+        \\          </InstrumentBranch>
+        \\        </Branches></InstrumentGroupDevice>
+        \\        <BranchInfo><ReceivingNote Value="92" /></BranchInfo>
+        \\      </DrumBranch>
+        \\    </Branches></DrumGroupDevice>
+        \\  </MidiTrack></Tracks></LiveSet>
+        \\</Ableton>
+    ;
+    const seq_files = [_]VirtualFile{
+        .{ .rel_path = "Seq.als", .bytes = seq_als },
+        .{ .rel_path = "Samples/long.wav", .bytes = wav_a },
+        .{ .rel_path = "Samples/layer.wav", .bytes = wav_b },
+    };
+    const seq_proj = try buildProject(a, &seq_files, "Seq");
+    // Placed in chain 1 (outer sel 1..1 preserved despite inner sel 0..0) as 2 separate sequential entries
+    try std.testing.expectEqual(@as(usize, 0), seq_proj.sound_cells[7 * 8 + 0].len);
+    try std.testing.expectEqual(@as(usize, 2), seq_proj.sound_cells[64 + 7 * 8 + 0].len);
 }
