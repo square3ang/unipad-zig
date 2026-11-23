@@ -1,12 +1,12 @@
 <!DOCTYPE html>
-<html lang="ko">
+<html lang="en">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <meta name="description" content="Ableton Live 프로젝트(.zip, 폴더, .als)를 서버 전송 없이 브라우저 WebAssembly로 UniPack .zip으로 변환하는 클라이언트 도구.">
-  <title>Ableton → UniPack 변환기 · UniPad Zig</title>
-  <link rel="stylesheet" href="./styles.css">
-  <script type="module" src="./app.js"></script>
+  <meta name="description" content="Convert Ableton Live projects (.zip, folder, or .als) into playable UniPack .zip archives directly in your browser with Zig WebAssembly.">
+  <title>Ableton → UniPack Converter · UniPad Zig</title>
+  <link rel="stylesheet" href="./styles.css?v=2">
+  <script type="module" src="./app.js?v=2"></script>
 </head>
 <body>
   <header class="site-header">
@@ -15,11 +15,10 @@
         <span class="brand-mark" aria-hidden="true"></span>
         <span class="brand-name">UniPad Zig</span>
       </div>
-      <nav aria-label="프로젝트 링크" data-i18n-aria-label="navAria">
+      <nav aria-label="Project links">
         <ul class="nav-list">
-          <li><span class="runtime-note" data-i18n="runtimeNote">100% 로컬 WASM 처리</span></li>
+          <li><span class="runtime-note">100% local WASM processing</span></li>
           <li><a href="https://github.com/square3ang/unipad-zig" target="_blank" rel="noopener noreferrer">GitHub</a></li>
-          <li><button type="button" id="lang-btn" class="lang-btn" aria-label="Switch language">English</button></li>
         </ul>
       </nav>
     </div>
@@ -27,13 +26,13 @@
 
   <main class="shell main-stack">
     <section class="intro" aria-labelledby="page-title">
-      <h1 id="page-title" data-i18n="pageTitle">Ableton Live → UniPack 변환기</h1>
-      <p class="lead" data-i18n-html="leadHtml">
-        Ableton Live 프로젝트(<code>.zip</code>, 프로젝트 폴더, <code>.als</code>)를 서버 전송 없이 브라우저 WebAssembly에서 바로 UniPack <code>.zip</code>으로 변환합니다.
+      <h1 id="page-title">Ableton Live → UniPack Converter</h1>
+      <p class="lead">
+        Convert Ableton Live projects (<code>.zip</code>, project folder, or <code>.als</code>) into UniPack <code>.zip</code> archives locally in your browser via WebAssembly, with no uploads.
       </p>
     </section>
 
-    <section class="workspace" aria-label="프로젝트 입력 및 변환" data-i18n-aria-label="workspaceAria">
+    <section class="workspace" aria-label="Project input and conversion">
       <div id="dropzone" class="dropzone" data-state="idle">
         <svg class="drop-icon" viewBox="0 0 48 48" width="48" height="48" fill="none" aria-hidden="true">
           <rect x="6" y="6" width="16" height="16" rx="3" stroke="currentColor" stroke-width="2.2"/>
@@ -41,11 +40,11 @@
           <rect x="6" y="26" width="16" height="16" rx="3" stroke="currentColor" stroke-width="2.2"/>
           <rect x="26" y="26" width="16" height="16" rx="3" fill="currentColor" fill-opacity="0.22" stroke="currentColor" stroke-width="2.2"/>
         </svg>
-        <p class="drop-heading" data-i18n-html="dropHeadingHtml">Ableton 프로젝트 <code>.zip</code> 또는 폴더를 여기에 놓으세요</p>
-        <p class="drop-hint" data-i18n="dropHint">샘플이 포함된 압축 파일이나 압축 해제된 프로젝트 폴더를 그대로 지원합니다.</p>
+        <p class="drop-heading">Drop an Ableton project <code>.zip</code> or folder here</p>
+        <p class="drop-hint">Supports compressed project archives with samples or unpacked Ableton project folders.</p>
         <div class="action-row">
-          <button type="button" id="pick-file-btn" class="btn btn-primary" data-i18n="pickFile">압축 또는 프로젝트 파일 선택</button>
-          <button type="button" id="pick-dir-btn" class="btn btn-secondary" data-i18n="pickDir">프로젝트 폴더 선택</button>
+          <button type="button" id="pick-file-btn" class="btn btn-primary">Choose archive or project file</button>
+          <button type="button" id="pick-dir-btn" class="btn btn-secondary">Choose project folder</button>
         </div>
         <input type="file" id="file-input" accept=".zip,.als" hidden>
         <input type="file" id="dir-input" webkitdirectory multiple hidden>
@@ -53,7 +52,7 @@
 
       <div id="progress-panel" class="progress-panel" hidden>
         <div class="progress-head">
-          <label for="convert-progress" id="progress-label" data-i18n="phasePrepare">변환 준비 중…</label>
+          <label for="convert-progress" id="progress-label">Preparing conversion…</label>
           <span id="progress-detail" class="mono"></span>
         </div>
         <progress id="convert-progress" max="100"></progress>
@@ -65,37 +64,37 @@
       <section id="result-panel" class="result-panel" aria-labelledby="result-title" hidden>
         <div class="result-head">
           <div>
-            <h2 id="result-title" data-i18n="resultTitle">변환 완료</h2>
+            <h2 id="result-title">Conversion complete</h2>
             <p id="result-meta" class="result-meta mono"></p>
           </div>
           <div class="result-actions">
-            <button type="button" id="download-btn" class="btn btn-primary" data-i18n="downloadBtn">UniPack .zip 다운로드</button>
-            <button type="button" id="reset-btn" class="btn btn-secondary" data-i18n="resetBtn">다른 프로젝트 변환</button>
+            <button type="button" id="download-btn" class="btn btn-primary">Download UniPack .zip</button>
+            <button type="button" id="reset-btn" class="btn btn-secondary">Convert another project</button>
           </div>
         </div>
         <dl class="metrics-grid">
           <div class="metric">
-            <dt data-i18n="mChains">체인</dt>
+            <dt>Chains</dt>
             <dd id="m-chains" class="mono">0</dd>
           </div>
           <div class="metric">
-            <dt data-i18n="mSounds">사운드</dt>
+            <dt>Sounds</dt>
             <dd id="m-sounds" class="mono">0</dd>
           </div>
           <div class="metric">
-            <dt data-i18n="mLedPads">LED 패드</dt>
+            <dt>LED pads</dt>
             <dd id="m-led-pads" class="mono">0</dd>
           </div>
           <div class="metric">
-            <dt data-i18n="mLedEvents">LED 이벤트</dt>
+            <dt>LED events</dt>
             <dd id="m-led-events" class="mono">0</dd>
           </div>
           <div class="metric">
-            <dt data-i18n="mAuto">AutoPlay</dt>
+            <dt>AutoPlay</dt>
             <dd id="m-auto" class="mono">0</dd>
           </div>
           <div class="metric">
-            <dt data-i18n="mSize">파일 크기</dt>
+            <dt>File size</dt>
             <dd id="m-size" class="mono">0 B</dd>
           </div>
         </dl>
@@ -103,13 +102,13 @@
     </section>
 
     <details class="notes">
-      <summary data-i18n="notesSummary">지원 항목 및 변환 참고사항</summary>
+      <summary>Supported features and notes</summary>
       <ul>
-        <li data-i18n-html="note1">Ableton Live 9부터 12까지 <code>.als</code> 스트리밍 파싱 (Drum Rack, Instrument Rack, Simpler / MultiSampler).</li>
-        <li data-i18n-html="note2">Simpler <code>SampleStart</code>/<code>SampleEnd</code> WAV·MP3 구간 트림 및 동일 패드 레이어 WAV 자동 믹싱.</li>
-        <li data-i18n-html="note3">MIDI Effect Rack(Pitch, Chord, Velocity, Note Length, Arpeggiator, Random) 및 MIDI Extension(<code>0save</code> + <code>.mid</code>) 라이트쇼 시뮬레이션.</li>
-        <li data-i18n-html="note4">구형 Launchpad S / Mini 2색 벨로시티 자동 감지 및 Novation RGB 팔레트 색 변환.</li>
-        <li data-i18n-html="note5">Arrangement <code>MidiClip</code> 기반 <code>autoPlay</code> 생성 및 미포함 팩토리 드럼 내장 뱅크 폴백.</li>
+        <li>Streaming <code>.als</code> parser for Ableton Live 9 through 12 (Drum Rack, Instrument Rack, Simpler / MultiSampler).</li>
+        <li>Simpler <code>SampleStart</code>/<code>SampleEnd</code> WAV and MP3 trimming plus automatic WAV mixing for layered pads.</li>
+        <li>MIDI Effect Rack (Pitch, Chord, Velocity, Note Length, Arpeggiator, Random) and MIDI Extension (<code>0save</code> + <code>.mid</code>) lightshow simulation.</li>
+        <li>Automatic Launchpad S / Mini 2-color velocity detection and mapping to the Novation RGB palette.</li>
+        <li>Arrangement <code>MidiClip</code> <code>autoPlay</code> generation and bundled factory drum fallback for uncollected Core Library kits.</li>
       </ul>
     </details>
   </main>

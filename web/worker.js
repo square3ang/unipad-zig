@@ -4,21 +4,13 @@ const te = new TextEncoder();
 
 let wasmPromise = null;
 
-class WorkerError extends Error {
-  constructor(code, detail = '') {
-    super(detail || code);
-    this.code = code;
-    this.detail = detail;
-  }
-}
-
 async function loadWasm() {
   if (!wasmPromise) {
     wasmPromise = (async () => {
       const url = new URL('./ableton-converter.wasm', self.location.href);
       try {
         const res = await fetch(url);
-        if (!res.ok) throw new WorkerError('wasm_http', String(res.status));
+        if (!res.ok) throw new Error(`Failed to load WASM module (HTTP ${res.status}).`);
         if (WebAssembly.instantiateStreaming && res.headers.get('content-type')?.includes('wasm')) {
           const { instance } = await WebAssembly.instantiateStreaming(res, {});
           return instance.exports;
@@ -38,13 +30,13 @@ async function loadWasm() {
 function readWasmError(ex) {
   const ptr = ex.wasm_last_error_ptr();
   const len = ex.wasm_last_error_len();
-  if (!ptr || !len) return '';
+  if (!ptr || !len) return 'An unknown conversion error occurred.';
   return td.decode(new Uint8Array(ex.memory.buffer, ptr, len));
 }
 
 function writeBytes(ex, bytes) {
   const ptr = ex.wasm_alloc(bytes.length);
-  if (!ptr) throw new WorkerError('oom');
+  if (!ptr) throw new Error('WASM memory allocation failed (project is too large).');
   new Uint8Array(ex.memory.buffer, ptr, bytes.length).set(bytes);
   return ptr;
 }
@@ -55,18 +47,18 @@ self.addEventListener('message', async (ev) => {
 
   const t0 = performance.now();
   try {
-    self.postMessage({ type: 'progress', phaseKey: 'phaseInit', determinate: false });
+    self.postMessage({ type: 'progress', phase: 'Initializing WASM engine…', determinate: false });
     const ex = await loadWasm();
     ex.wasm_reset();
 
     if (msg.mode === 'zip') {
-      self.postMessage({ type: 'progress', phaseKey: 'phaseUnzip', determinate: false });
+      self.postMessage({ type: 'progress', phase: 'Extracting and filtering archive…', determinate: false });
       const zipBytes = new Uint8Array(msg.zipBuffer);
       const ptr = writeBytes(ex, zipBytes);
       const added = ex.wasm_add_zip(ptr, zipBytes.length);
       ex.wasm_free(ptr, zipBytes.length);
-      if (added < 0) throw new WorkerError('zip_read', readWasmError(ex));
-      if (added === 0) throw new WorkerError('zip_empty');
+      if (added < 0) throw new Error(`Failed to read archive: ${readWasmError(ex)}`);
+      if (added === 0) throw new Error('No Ableton project (.als) or audio files found inside the archive.');
     } else {
       const entries = msg.files || [];
       const total = entries.length;
@@ -79,11 +71,11 @@ self.addEventListener('message', async (ev) => {
         const rc = ex.wasm_add_file(pPtr, pathBytes.length, dPtr, dataBytes.length);
         ex.wasm_free(pPtr, pathBytes.length);
         if (dPtr) ex.wasm_free(dPtr, dataBytes.length);
-        if (rc < 0) throw new WorkerError('file_add', readWasmError(ex));
+        if (rc < 0) throw new Error(`Failed to add file: ${readWasmError(ex)}`);
         if (i === total - 1 || i % 10 === 0) {
           self.postMessage({
             type: 'progress',
-            phaseKey: 'phaseLoad',
+            phase: 'Loading project files…',
             determinate: true,
             value: Math.round(((i + 1) / total) * 100),
             detail: `${i + 1} / ${total}`,
@@ -92,12 +84,12 @@ self.addEventListener('message', async (ev) => {
       }
     }
 
-    self.postMessage({ type: 'progress', phaseKey: 'phaseConvert', determinate: false });
+    self.postMessage({ type: 'progress', phase: 'Parsing .als and building UniPack…', determinate: false });
     const fbBytes = te.encode(msg.fallbackTitle || 'Ableton Project');
     const fbPtr = writeBytes(ex, fbBytes);
     const rc = ex.wasm_convert(fbPtr, fbBytes.length);
     ex.wasm_free(fbPtr, fbBytes.length);
-    if (rc !== 0) throw new WorkerError('convert_fail', readWasmError(ex));
+    if (rc !== 0) throw new Error(`Conversion failed: ${readWasmError(ex)}`);
 
     const jPtr = ex.wasm_out_json_ptr();
     const jLen = ex.wasm_out_json_len();
@@ -118,14 +110,9 @@ self.addEventListener('message', async (ev) => {
       [outZip.buffer],
     );
   } catch (err) {
-    if (err instanceof WorkerError) {
-      self.postMessage({ type: 'error', code: err.code, detail: err.detail });
-    } else {
-      self.postMessage({
-        type: 'error',
-        code: 'unknown',
-        detail: err instanceof Error ? err.message : String(err),
-      });
-    }
+    self.postMessage({
+      type: 'error',
+      message: err instanceof Error ? err.message : String(err),
+    });
   }
 });
