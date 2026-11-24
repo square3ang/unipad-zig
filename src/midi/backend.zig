@@ -359,6 +359,32 @@ pub const Midi = struct {
         }
     }
 
+    /// Blocks up to `timeout_ns` waiting for incoming MIDI events (wakes immediately on hardware input:
+    /// Linux ALSA ppoll, Windows CreateEvent + high-res waitable timer, macOS CoreMIDI dispatch_semaphore).
+    /// Safe to call without holding the app state mutex while `Midi` is alive (`seq`/`plat` are immutable after init).
+    pub fn waitInput(m: *const Midi, timeout_ns: u64) void {
+        if (builtin.os.tag == .linux) {
+            if (m.seq) |seq| {
+                var pfds: [8]std.os.linux.pollfd = undefined;
+                const n = c.snd_seq_poll_descriptors(seq, @ptrCast(&pfds), pfds.len, std.os.linux.POLL.IN);
+                if (n > 0) {
+                    var ts: std.os.linux.timespec = .{
+                        .sec = @intCast(timeout_ns / 1_000_000_000),
+                        .nsec = @intCast(timeout_ns % 1_000_000_000),
+                    };
+                    _ = std.os.linux.ppoll(&pfds, @intCast(n), &ts, null);
+                    return;
+                }
+            }
+        } else {
+            if (m.plat) |p| {
+                c.midi_plat_wait(p, timeout_ns);
+                return;
+            }
+        }
+        c.SDL_DelayNS(timeout_ns);
+    }
+
     /// Polls pending incoming MIDI events into `out`, returning the slice written.
     pub fn poll(m: *Midi, out: []driver.InputEvent) []driver.InputEvent {
         if (m.connected_in == null) return out[0..0];

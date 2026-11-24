@@ -67,6 +67,11 @@ pub const App = struct {
     pending_open_path: ?[]u8 = null,
     last_pack_path: ?[]u8 = null,
 
+    // Async MIDI I/O + LED/Player tick thread (decoupled from GPU/VSync)
+    state_mtx: ?*c.SDL_Mutex = null,
+    midi_thread: ?*c.SDL_Thread = null,
+    midi_quit: std.atomic.Value(bool) = .init(false),
+
     // Settings state
     cfg: config_mod.Config = .{},
     audio_frames: u32 = 128,
@@ -95,6 +100,7 @@ pub const App = struct {
             .midi = midi_backend.Midi.init(gpa),
             .nfd_ready = c.NFD_Init() == c.NFD_OKAY,
             .cfg = cfg,
+            .state_mtx = c.SDL_CreateMutex(),
             .audio_frames = cfg.audio_frames,
             .volume = cfg.volume,
             .anti_pop = cfg.anti_pop,
@@ -150,6 +156,7 @@ pub const App = struct {
     }
 
     pub fn deinit(a: *App) void {
+        a.stopMidiThread();
         a.saveConfig();
         if (a.dialog_thread) |t| {
             c.SDL_WaitThread(t, null);
@@ -161,9 +168,63 @@ pub const App = struct {
         a.midi.sendClearLed();
         a.midi.deinit();
         a.player.deinit();
+        if (a.state_mtx) |m| c.SDL_DestroyMutex(m);
         a.ports_arena.deinit();
         a.g.deinit();
         a.gpa.destroy(a);
+    }
+
+    fn lockState(a: *App) void {
+        if (a.state_mtx) |m| c.SDL_LockMutex(m);
+    }
+
+    fn unlockState(a: *App) void {
+        if (a.state_mtx) |m| c.SDL_UnlockMutex(m);
+    }
+
+    fn startMidiThread(a: *App) void {
+        if (a.midi_thread != null) return;
+        a.midi_quit.store(false, .release);
+        a.midi_thread = c.SDL_CreateThread(midiThreadMain, "unipad-midi", a);
+    }
+
+    fn stopMidiThread(a: *App) void {
+        if (a.midi_thread) |t| {
+            a.midi_quit.store(true, .release);
+            c.SDL_WaitThread(t, null);
+            a.midi_thread = null;
+        }
+    }
+
+    fn midiThreadMain(ud: ?*anyopaque) callconv(.c) c_int {
+        const a: *App = @ptrCast(@alignCast(ud));
+        while (!a.midi_quit.load(.acquire)) {
+            var has_active = false;
+            var has_midi_in = false;
+            {
+                a.lockState();
+                defer a.unlockState();
+
+                const now = nowMs();
+                a.pollMidi(now);
+                a.player.smooth_guide_rgb = a.midi.useFastLed();
+                a.player.tick(now);
+                a.flushLedToMidi();
+
+                has_active = a.player.anims.items.len > 0 or a.player.auto_playing or a.player.practice_playing or a.player.wormholes.items.len > 0;
+                has_midi_in = a.midi.connected_in != null;
+            }
+
+            // Sleep outside lock: wakes immediately on hardware MIDI input (ALSA ppoll),
+            // or every 0.5ms (~2 kHz) while LED/AutoPlay/Practice are active.
+            const wait_ns: u64 = if (has_active) 500_000 else 2_000_000;
+            if (has_midi_in) {
+                a.midi.waitInput(wait_ns);
+            } else {
+                c.SDL_DelayNS(wait_ns);
+            }
+        }
+        return 0;
     }
 
     fn saveConfig(a: *App) void {
@@ -218,11 +279,16 @@ pub const App = struct {
     }
 
     pub fn loadPackPath(a: *App, path: []const u8) void {
+        // Perform archive/audio decoding outside state_mtx so MIDI/LED thread stays responsive.
         const pk = pack_mod.load(a.gpa, a.io, path, a.engine.rate) catch |err| {
             std.log.err("failed to load UniPack \"{s}\": {t}", .{ path, err });
+            a.lockState();
             a.setStatus("Load failed: {t}", .{err});
+            a.unlockState();
             return;
         };
+        a.lockState();
+        defer a.unlockState();
         if (a.last_pack_path) |old| a.gpa.free(old);
         a.last_pack_path = a.gpa.dupe(u8, path) catch null;
         a.player.loadPack(pk);
@@ -235,35 +301,37 @@ pub const App = struct {
     }
 
     pub fn run(a: *App) void {
+        a.startMidiThread();
+        defer a.stopMidiThread();
+
         var last_draw_ms: f64 = -1000.0;
         while (a.running) {
             const now = nowMs();
             a.handlePendingDialog();
             a.pollEvents(now);
-            a.pollMidi(now);
-            a.player.smooth_guide_rgb = a.midi.useFastLed();
-            a.player.tick(now);
-            a.flushLedToMidi();
 
             // Periodically retry MIDI auto-connect if disconnected
-            if (!a.midi.isConnected() and now - a.last_midi_scan_ms > 2000.0) {
-                a.last_midi_scan_ms = now;
-                a.refreshDevices();
-                if (a.midi.autoConnect(a.ports_arena.allocator())) {
-                    a.player.smooth_guide_rgb = a.midi.useFastLed();
-                    a.player.pushFullLedSync();
-                    a.flushLedToMidi();
-                    a.setStatus("MIDI connected: {s}", .{a.midi.model.displayName()});
+            if (now - a.last_midi_scan_ms > 2000.0) {
+                a.lockState();
+                if (!a.midi.isConnected()) {
+                    a.last_midi_scan_ms = now;
+                    a.refreshDevices();
+                    if (a.midi.autoConnect(a.ports_arena.allocator())) {
+                        a.player.smooth_guide_rgb = a.midi.useFastLed();
+                        a.player.pushFullLedSync();
+                        a.flushLedToMidi();
+                        a.setStatus("MIDI connected: {s}", .{a.midi.model.displayName()});
+                    }
                 }
+                a.unlockState();
             }
 
-            // Pace GPU redraws (~240 Hz cap, or immediately on click/scroll) independently from ~1 kHz MIDI/LED ticks.
+            // Pace GPU redraws (~240 Hz cap, or immediately on click/scroll); hardware MIDI/LED runs independently on unipad-midi thread.
             if (a.g.clicked or a.g.wheel != 0 or now - last_draw_ms >= 4.0) {
                 last_draw_ms = now;
                 a.draw(now);
             } else {
-                // Sub-millisecond sleep keeps MIDI input & hardware LED updates crisp (~1 kHz) without pegging CPU.
-                c.SDL_DelayNS(500_000);
+                c.SDL_Delay(1);
             }
         }
     }
@@ -431,11 +499,14 @@ pub const App = struct {
         const scale = c.SDL_GetWindowPixelDensity(a.g.win);
         var ev: c.SDL_Event = undefined;
         while (c.SDL_PollEvent(&ev)) {
+            if (ev.type == c.SDL_EVENT_DROP_FILE) {
+                if (ev.drop.data != null) a.loadPackPath(std.mem.span(ev.drop.data));
+                continue;
+            }
+            a.lockState();
+            defer a.unlockState();
             switch (ev.type) {
                 c.SDL_EVENT_QUIT => a.running = false,
-                c.SDL_EVENT_DROP_FILE => {
-                    if (ev.drop.data != null) a.loadPackPath(std.mem.span(ev.drop.data));
-                },
                 c.SDL_EVENT_MOUSE_MOTION => {
                     a.g.mx = ev.motion.x * scale;
                     a.g.my = ev.motion.y * scale;
@@ -675,12 +746,17 @@ pub const App = struct {
     }
 
     fn draw(a: *App, now: f64) void {
-        a.g.beginFrame();
-        a.g.vgrad(0, 0, a.g.w, a.g.h, gfx.bg, gfx.bg_bottom);
-        a.drawHeader(now);
-        a.drawLaunchpad();
-        a.drawFooter(now);
-        if (a.settings_open) a.drawSettings();
+        {
+            a.lockState();
+            defer a.unlockState();
+            a.g.beginFrame();
+            a.g.vgrad(0, 0, a.g.w, a.g.h, gfx.bg, gfx.bg_bottom);
+            a.drawHeader(now);
+            a.drawLaunchpad();
+            a.drawFooter(now);
+            if (a.settings_open) a.drawSettings();
+        }
+        // Present outside state_mtx so Vulkan swapchain wait never stalls async MIDI/LED ticks.
         a.g.present();
     }
 

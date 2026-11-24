@@ -2,6 +2,7 @@
 #include "midi_platform.h"
 #include <CoreMIDI/CoreMIDI.h>
 #include <CoreFoundation/CoreFoundation.h>
+#include <dispatch/dispatch.h>
 #include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
@@ -14,6 +15,7 @@ struct MidiPlat {
     MIDIPortRef out_port;
     MIDIEndpointRef connected_src;
     MIDIEndpointRef connected_dst;
+    dispatch_semaphore_t wake_sem;
     uint8_t q[MIDI_Q_CAP][3];
     _Atomic uint32_t q_head;
     _Atomic uint32_t q_tail;
@@ -22,6 +24,7 @@ struct MidiPlat {
 static void read_proc(const MIDIPacketList *list, void *refcon, void *src_refcon) {
     (void)src_refcon;
     MidiPlat *m = (MidiPlat *)refcon;
+    int pushed = 0;
     const MIDIPacket *pkt = &list->packet[0];
     for (UInt32 i = 0; i < list->numPackets; i++) {
         UInt16 off = 0;
@@ -42,6 +45,7 @@ static void read_proc(const MIDIPacketList *list, void *refcon, void *src_refcon
                     m->q[h % MIDI_Q_CAP][1] = pkt->data[off + 1];
                     m->q[h % MIDI_Q_CAP][2] = pkt->data[off + 2];
                     atomic_store_explicit(&m->q_head, h + 1, memory_order_release);
+                    pushed = 1;
                 }
                 off += 3;
             } else {
@@ -50,6 +54,7 @@ static void read_proc(const MIDIPacketList *list, void *refcon, void *src_refcon
         }
         pkt = MIDIPacketNext(pkt);
     }
+    if (pushed && m->wake_sem) dispatch_semaphore_signal(m->wake_sem);
 }
 
 static int endpoint_name(MIDIEndpointRef ep, char *buf, uint32_t cap) {
@@ -65,6 +70,7 @@ static int endpoint_name(MIDIEndpointRef ep, char *buf, uint32_t cap) {
 MidiPlat *midi_plat_create(void) {
     MidiPlat *m = calloc(1, sizeof(*m));
     if (!m) return NULL;
+    m->wake_sem = dispatch_semaphore_create(0);
     MIDIClientCreate(CFSTR("unipad-zig"), NULL, NULL, &m->client);
     MIDIInputPortCreate(m->client, CFSTR("in"), read_proc, m, &m->in_port);
     MIDIOutputPortCreate(m->client, CFSTR("out"), &m->out_port);
@@ -77,6 +83,7 @@ void midi_plat_destroy(MidiPlat *m) {
     if (m->in_port) MIDIPortDispose(m->in_port);
     if (m->out_port) MIDIPortDispose(m->out_port);
     if (m->client) MIDIClientDispose(m->client);
+    if (m->wake_sem) dispatch_release(m->wake_sem);
     free(m);
 }
 
@@ -132,5 +139,13 @@ int midi_plat_poll(MidiPlat *m, uint8_t out_msg[3]) {
     memcpy(out_msg, m->q[t % MIDI_Q_CAP], 3);
     atomic_store_explicit(&m->q_tail, t + 1, memory_order_release);
     return 1;
+}
+
+void midi_plat_wait(MidiPlat *m, uint64_t timeout_ns) {
+    if (!m || !m->wake_sem) return;
+    uint32_t t = atomic_load_explicit(&m->q_tail, memory_order_relaxed);
+    uint32_t h = atomic_load_explicit(&m->q_head, memory_order_acquire);
+    if (t != h) return;
+    dispatch_semaphore_wait(m->wake_sem, dispatch_time(DISPATCH_TIME_NOW, (int64_t)timeout_ns));
 }
 #endif

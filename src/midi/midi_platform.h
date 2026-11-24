@@ -14,3 +14,4 @@ int midi_plat_open_output(MidiPlat *m, uint32_t idx);
 void midi_plat_close(MidiPlat *m);
 void midi_plat_send(MidiPlat *m, const uint8_t *bytes, uint32_t len);
 int midi_plat_poll(MidiPlat *m, uint8_t out_msg[3]);
+void midi_plat_wait(MidiPlat *m, uint64_t timeout_ns);
