@@ -170,6 +170,8 @@ pub const Gfx = struct {
             std.log.err("no graphics device: {s}", .{c.SDL_GetError()});
             return error.GpuDevice;
         }
+        // Prefer non-blocking present (MAILBOX / IMMEDIATE) so MIDI/LED tick loop is never stalled by VSync FIFO.
+        c.rb_set_vsync(0);
         var g: Gfx = .{ .gpa = gpa, .win = win };
         const sh = c.sg_make_shader(&shaderDesc());
         g.pipelines = .{ makePipeline(sh, false), makePipeline(sh, true) };
@@ -569,10 +571,10 @@ pub const Gfx = struct {
         return font_sizes.len - 1;
     }
 
-    fn textEntry(g: *Gfx, s: []const u8, size: u16, col_in: Color) ?*TextEntry {
+    fn textEntry(g: *Gfx, s: []const u8, size: u16) ?*TextEntry {
         if (s.len == 0) return null;
-        const col = col_in.alpha(255);
-        var hasher = std.hash.Wyhash.init(@as(u64, col.r) << 24 | @as(u64, col.g) << 16 | @as(u64, col.b) << 8 | 255);
+        // Cache white glyph texture keyed only by (text, size) and tint via vertex color so animated LED labels never thrash TTF/Vulkan.
+        var hasher = std.hash.Wyhash.init(0x9E3779B97F4A7C15);
         hasher.update(s);
         const key: TextKey = .{ .hash = hasher.final(), .size = size };
         const gop = g.text_cache.getOrPut(g.gpa, key) catch return null;
@@ -584,7 +586,7 @@ pub const Gfx = struct {
             _ = g.text_cache.remove(key);
             return null;
         };
-        const blended = c.TTF_RenderText_Blended(font, s.ptr, s.len, .{ .r = col.r, .g = col.g, .b = col.b, .a = 255 });
+        const blended = c.TTF_RenderText_Blended(font, s.ptr, s.len, .{ .r = 255, .g = 255, .b = 255, .a = 255 });
         defer c.SDL_DestroySurface(blended);
         const surf = if (blended != null) c.SDL_ConvertSurface(blended, c.SDL_PIXELFORMAT_RGBA32) else null;
         defer c.SDL_DestroySurface(surf);
@@ -597,9 +599,9 @@ pub const Gfx = struct {
         return gop.value_ptr;
     }
 
-    fn drawTextTex(g: *Gfx, t: *Texture, x: f32, y: f32, w: f32, h: f32, a: u8) void {
+    fn drawTextTex(g: *Gfx, t: *Texture, x: f32, y: f32, w: f32, h: f32, col_in: Color) void {
         const u_end = w / t.w;
-        const col = [4]u8{ 255, 255, 255, a };
+        const col = [4]u8{ col_in.r, col_in.g, col_in.b, col_in.a };
         const v = [4]Vertex{
             .{ .x = x, .y = y, .u = 0, .v = 0, .col = col },
             .{ .x = x + w, .y = y, .u = u_end, .v = 0, .col = col },
@@ -610,27 +612,27 @@ pub const Gfx = struct {
     }
 
     pub fn text(g: *Gfx, s: []const u8, x: f32, y: f32, size: u16, col: Color) void {
-        const e = g.textEntry(s, size, col) orelse return;
-        g.drawTextTex(e.tex, @round(x), @round(y), e.w, e.h, col.a);
+        const e = g.textEntry(s, size) orelse return;
+        g.drawTextTex(e.tex, @round(x), @round(y), e.w, e.h, col);
     }
 
     pub fn textCentered(g: *Gfx, s: []const u8, cx: f32, cy: f32, size: u16, col: Color) void {
-        const e = g.textEntry(s, size, col) orelse return;
-        g.drawTextTex(e.tex, @round(cx - e.w / 2), @round(cy - e.h / 2), e.w, e.h, col.a);
+        const e = g.textEntry(s, size) orelse return;
+        g.drawTextTex(e.tex, @round(cx - e.w / 2), @round(cy - e.h / 2), e.w, e.h, col);
     }
 
     pub fn textClip(g: *Gfx, s: []const u8, x: f32, y: f32, max_w: f32, size: u16, col: Color) void {
-        const e = g.textEntry(s, size, col) orelse return;
-        g.drawTextTex(e.tex, @round(x), @round(y), @min(e.w, max_w), e.h, col.a);
+        const e = g.textEntry(s, size) orelse return;
+        g.drawTextTex(e.tex, @round(x), @round(y), @min(e.w, max_w), e.h, col);
     }
 
     pub fn textRight(g: *Gfx, s: []const u8, right: f32, y: f32, size: u16, col: Color) void {
-        const e = g.textEntry(s, size, col) orelse return;
-        g.drawTextTex(e.tex, @round(right - e.w), @round(y), e.w, e.h, col.a);
+        const e = g.textEntry(s, size) orelse return;
+        g.drawTextTex(e.tex, @round(right - e.w), @round(y), e.w, e.h, col);
     }
 
     pub fn measure(g: *Gfx, s: []const u8, size: u16) f32 {
-        const e = g.textEntry(s, size, white) orelse return 0;
+        const e = g.textEntry(s, size) orelse return 0;
         return e.w;
     }
 

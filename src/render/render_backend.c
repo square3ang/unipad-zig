@@ -474,8 +474,16 @@ void rb_shutdown(void) {
 }
 
 void rb_set_vsync(int mode) {
-    VkPresentModeKHR want = mode == 1 ? VK_PRESENT_MODE_FIFO_KHR : mode == 0 ? VK_PRESENT_MODE_IMMEDIATE_KHR : VK_PRESENT_MODE_FIFO_RELAXED_KHR;
-    want = rb_supported_mode(want);
+    VkPresentModeKHR want;
+    if (mode == 1) {
+        want = VK_PRESENT_MODE_FIFO_KHR;
+    } else if (mode == 0) {
+        // Prefer tear-free non-blocking MAILBOX, then IMMEDIATE, falling back to FIFO.
+        want = rb_supported_mode(VK_PRESENT_MODE_MAILBOX_KHR);
+        if (want == VK_PRESENT_MODE_FIFO_KHR) want = rb_supported_mode(VK_PRESENT_MODE_IMMEDIATE_KHR);
+    } else {
+        want = rb_supported_mode(VK_PRESENT_MODE_FIFO_RELAXED_KHR);
+    }
     if (want != rb_mode) rb_stale = true;
     rb_mode = want;
 }

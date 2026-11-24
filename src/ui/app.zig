@@ -235,6 +235,7 @@ pub const App = struct {
     }
 
     pub fn run(a: *App) void {
+        var last_draw_ms: f64 = -1000.0;
         while (a.running) {
             const now = nowMs();
             a.handlePendingDialog();
@@ -256,9 +257,14 @@ pub const App = struct {
                 }
             }
 
-            a.draw(now);
-            // Yield lightly to avoid pegging a core when vsync is off
-            c.SDL_Delay(1);
+            // Pace GPU redraws (~240 Hz cap, or immediately on click/scroll) independently from ~1 kHz MIDI/LED ticks.
+            if (a.g.clicked or a.g.wheel != 0 or now - last_draw_ms >= 4.0) {
+                last_draw_ms = now;
+                a.draw(now);
+            } else {
+                // Sub-millisecond sleep keeps MIDI input & hardware LED updates crisp (~1 kHz) without pegging CPU.
+                c.SDL_DelayNS(500_000);
+            }
         }
     }
 
