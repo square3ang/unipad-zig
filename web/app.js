@@ -26,7 +26,7 @@ const mSize = document.getElementById('m-size');
 
 const RELEVANT_RE = /(?:^|\/)0save$|\.(?:als|wav|mp3|ogg|flac|aiff?|midi?|amxd|pal|txt)$/i;
 
-const worker = new Worker('./worker.js?v=4', { type: 'module' });
+const worker = new Worker('./worker.js?v=5', { type: 'module' });
 let busy = false;
 let lastBlobUrl = null;
 let lastFileName = 'unipack.zip';

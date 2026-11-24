@@ -1195,9 +1195,17 @@ pub const MidiExtSettings = struct {
 
 pub fn parseGenericMidiExtSettings(mx: MxDeviceData) MidiExtSettings {
     var s: MidiExtSettings = .{};
+    const name = if (mx.patch_name.len > 0) mx.patch_name else basenameOf(mx.patch_rel);
+    // Only MIDIext 5.0 uses param[0] (Mode: Launch/Mask) and param[1] (Loop toggle 0..1).
+    // Older Midi Extension.amxd stores tempo numboxes (e.g. 120) at indices 0..3.
+    const is_v5 = containsIgnoreCase(name, "midiext5");
     for (mx.params) |p| {
-        if (p.index == 0 and @as(i32, @intFromFloat(@round(p.value))) == 1) s.is_mask = true;
-        if (p.index == 1 and p.value >= 0.5) s.loop = true;
+        if (is_v5) {
+            if (p.index == 0 and @round(p.value) == 1.0) s.is_mask = true;
+            if (p.index == 1 and p.value >= 0.5 and p.value <= 1.0) s.loop = true;
+        } else {
+            if (std.ascii.eqlIgnoreCase(p.name, "Loop") and p.value >= 0.5 and p.value <= 1.0) s.loop = true;
+        }
     }
     return s;
 }
@@ -1623,4 +1631,28 @@ test "m4l: custom Max palette parser" {
     try std.testing.expectEqual(@as(u32, 0xFF00FF00), tbl[2]);
     try std.testing.expectEqual(@as(u32, 0xFF0000FF), tbl[3]);
     try std.testing.expectEqual(@as(u32, 0xFFFFFFFF), tbl[7]);
+}
+
+test "m4l: classic Midi Extension BPM numboxes do not trigger MIDIext5 loop/mask" {
+    const legacy_params = [_]MxParam{
+        .{ .index = 0, .kind = .float, .name = "live.numbox", .value = 120.0 },
+        .{ .index = 1, .kind = .float, .name = "live.numbox[1]", .value = 120.0 },
+    };
+    const legacy = parseGenericMidiExtSettings(.{
+        .patch_name = "Midi Extension.amxd",
+        .params = &legacy_params,
+    });
+    try std.testing.expect(!legacy.is_mask);
+    try std.testing.expect(!legacy.loop);
+
+    const v5_params = [_]MxParam{
+        .{ .index = 0, .kind = .enum_v, .name = "Mode", .value = 1.0 },
+        .{ .index = 1, .kind = .float, .name = "Loop", .value = 1.0 },
+    };
+    const v5 = parseGenericMidiExtSettings(.{
+        .patch_name = "MIDIext5.0.amxd",
+        .params = &v5_params,
+    });
+    try std.testing.expect(v5.is_mask);
+    try std.testing.expect(v5.loop);
 }
