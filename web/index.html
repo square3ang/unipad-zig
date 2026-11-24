@@ -6,7 +6,7 @@
   <meta name="description" content="Convert Ableton Live projects (.zip, folder, or .als) into playable UniPack .zip archives directly in your browser with Zig WebAssembly.">
   <title>Ableton → UniPack Converter · UniPad Zig</title>
   <link rel="stylesheet" href="./styles.css?v=2">
-  <script type="module" src="./app.js?v=3"></script>
+  <script type="module" src="./app.js?v=4"></script>
 </head>
 <body>
   <header class="site-header">
@@ -104,18 +104,18 @@
     <details class="notes">
       <summary>Supported features and notes</summary>
       <ul>
-        <li>Streaming <code>.als</code> parser for Ableton Live 9 through 12 (Drum Rack, Instrument Rack, Simpler / MultiSampler).</li>
-        <li>Simpler <code>SampleStart</code>/<code>SampleEnd</code> WAV and MP3 trimming plus automatic WAV mixing for layered pads.</li>
-        <li>MIDI Effect Rack (Pitch, Chord, Velocity, Note Length, Arpeggiator, Random) and MIDI Extension (<code>0save</code> + <code>.mid</code>) lightshow simulation.</li>
-        <li>Automatic Launchpad S / Mini 2-color velocity detection and mapping to the Novation RGB palette.</li>
-        <li>Arrangement <code>MidiClip</code> <code>autoPlay</code> generation and bundled factory drum fallback for uncollected Core Library kits.</li>
+        <li>Streaming <code>.als</code> parser for Ableton Live 8 through 12 (Drum Rack, Instrument Rack, Simpler / MultiSampler, Rack Macro mapping).</li>
+        <li>Simpler <code>SampleStart</code>/<code>SampleEnd</code> trimming, transpose, fade-in/out, layered WAV mixing, and M4L instruments (<code>Supersonic</code>, <code>CycleSamples</code>).</li>
+        <li>MIDI Effect Rack (Pitch, Chord, Velocity, Note Length, Arpeggiator, Random) and Max for Live lightshow/control adapters (<code>MIDIext</code>, <code>MidiFire</code>, <code>MidiLauncher</code>/<code>Pro</code>, <code>Lightspeed</code>, <code>CycleLights</code>, <code>Resonator 1–4</code>, <code>Flip</code>, <code>Iris</code>, <code>Delay</code>, <code>Infinity</code>, <code>Depths</code>, <code>GridFilter</code>, <code>MidiTransform</code>, <code>SetNotes</code>, <code>Multi</code>, <code>Wormhole</code>/<code>Blackhole</code>/<code>AutoPage</code>/<code>Twist</code>).</li>
+        <li>Automatic Launchpad S / Mini 2-color velocity mapping and custom Max palette (<code>.pal</code>/<code>.txt</code>) support.</li>
+        <li>Arrangement <code>MidiClip</code> &amp; page automation <code>autoPlay</code> generation plus bundled factory drum fallback.</li>
       </ul>
     </details>
   </main>
 
   <footer class="site-footer">
     <div class="shell footer-inner">
-      <span>GPL-3.0 · Pure Zig WebAssembly</span>
+      <span>GPL-3.0 · Pure Zig WebAssembly · M4L adapters derived from <a href="https://github.com/anthonyhfm/Amethyst" target="_blank" rel="noopener noreferrer">Amethyst</a> (GPL-3.0)</span>
       <span class="mono">unipad-zig/web</span>
     </div>
   </footer>

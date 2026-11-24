@@ -4,6 +4,9 @@
 //! simulates MIDI Effect Rack lightshows (Pitch, Chord, Velocity, Note Length,
 //! Arpeggiator, Launchpad S->RGB color mapping), and builds AutoPlay from
 //! Arrangement MidiClips. Compiles on both desktop and wasm32-freestanding.
+//!
+//! Includes Max for Live device adapters, Rack Macro mapping, custom palette parsing,
+//! and AutoPlay automation logic ported from Amethyst (https://github.com/anthonyhfm/Amethyst, GPL-3.0).
 const std = @import("std");
 const builtin = @import("builtin");
 const is_wasm = builtin.cpu.arch.isWasm();
@@ -12,6 +15,7 @@ const decode = if (is_wasm) struct {} else @import("../audio/decode.zig");
 const palette = @import("palette.zig");
 const pack_mod = if (is_wasm) struct {} else @import("pack.zig");
 const types = @import("types.zig");
+const m4l = @import("ableton_m4l.zig");
 const drums_bank = @import("drums_bank");
 
 pub const VirtualFile = types.VirtualFile;
@@ -20,6 +24,10 @@ const SoundEntry = types.SoundEntry;
 const LedEvent = types.LedEvent;
 const LedAnimation = types.LedAnimation;
 const AutoPlayEvent = types.AutoPlayEvent;
+const SimNote = m4l.SimNote;
+const NoteLayout = m4l.NoteLayout;
+pub const midiNoteToXY = m4l.midiNoteToXY;
+pub const xyToMidiNote = m4l.xyToMidiNote;
 
 pub const ConvertSummary = struct {
     chains: u8,
@@ -129,8 +137,8 @@ pub fn loadFromFiles(
             pk.led_table[ci] = &.{};
         } else {
             const anims = try pa.alloc(LedAnimation, anim_list.len);
-            for (anim_list, 0..) |evs, k| {
-                anims[k] = .{ .events = try pa.dupe(LedEvent, evs), .loop = 1 };
+            for (anim_list, 0..) |anim, k| {
+                anims[k] = .{ .events = try pa.dupe(LedEvent, anim.events), .loop = anim.loop };
             }
             pk.led_table[ci] = anims;
             led_count += anim_list.len;
@@ -335,7 +343,11 @@ fn emitUniPackEntries(
                     sound_mappings += 1;
                     const uni_loop: i32 = if (se.loop < 0) 0 else se.loop + 1;
                     try ks_buf.print(wa, "{d} {d} {d} {s}", .{ ch + 1, r + 1, col + 1, sound_names[se.sample_id] });
-                    if (uni_loop != 1) try ks_buf.print(wa, " {d}", .{uni_loop});
+                    if (se.wormhole) |wh| {
+                        try ks_buf.print(wa, " {d} {d}", .{ uni_loop, @as(u32, wh) + 1 });
+                    } else if (uni_loop != 1) {
+                        try ks_buf.print(wa, " {d}", .{uni_loop});
+                    }
                     try ks_buf.append(wa, '\n');
                 }
             }
@@ -352,7 +364,8 @@ fn emitUniPackEntries(
                 const anim_list = proj.led_cells[(ch * 8 + r) * 8 + col];
                 if (anim_list.len == 0) continue;
                 led_pads += 1;
-                for (anim_list, 0..) |evs, k| {
+                for (anim_list, 0..) |anim, k| {
+                    const evs = anim.events;
                     led_events += evs.len;
                     var lb: std.ArrayList(u8) = .empty;
                     for (evs) |ev| {
@@ -392,9 +405,9 @@ fn emitUniPackEntries(
                         }
                     }
                     const lpath = if (anim_list.len == 1)
-                        try std.fmt.allocPrint(wa, "keyLED/{d} {d} {d} 1", .{ ch + 1, r + 1, col + 1 })
+                        try std.fmt.allocPrint(wa, "keyLED/{d} {d} {d} {d}", .{ ch + 1, r + 1, col + 1, anim.loop })
                     else
-                        try std.fmt.allocPrint(wa, "keyLED/{d} {d} {d} 1 {c}", .{ ch + 1, r + 1, col + 1, @as(u8, 'a') + @as(u8, @intCast(@min(k, 25))) });
+                        try std.fmt.allocPrint(wa, "keyLED/{d} {d} {d} {d} {c}", .{ ch + 1, r + 1, col + 1, anim.loop, @as(u8, 'a') + @as(u8, @intCast(@min(k, 25))) });
                     try sink.writeEntry(sink_alloc, lpath, lb.items);
                 }
             }
@@ -443,13 +456,18 @@ fn writeZipEntry(a: std.mem.Allocator, arch: *c.archive, rel_path: []const u8, d
 // Intermediate Ableton IR & Project Builder
 // ============================================================================
 
+const LedCellAnim = struct {
+    events: []const LedEvent,
+    loop: u8 = 1,
+};
+
 const ConvertedProject = struct {
     title: []const u8,
     producer: []const u8,
     chain_count: u8,
     raw_sounds: []const VirtualFile,
     sound_cells: [][]const SoundEntry,
-    led_cells: [][]const []const LedEvent,
+    led_cells: [][]const LedCellAnim,
     auto_play: []const AutoPlayEvent,
 };
 
@@ -466,6 +484,38 @@ const PadMapping = struct {
     sample_end: u64 = 0,
     default_duration: u64 = 0,
     default_sample_rate: u32 = 0,
+    transpose_semitones: i8 = 0,
+    fade_in_ms: f32 = 0.0,
+    fade_out_ms: f32 = 0.0,
+    volume_db: f32 = 0.0,
+};
+
+const MxInstrumentEntry = struct {
+    sel_min: u8 = 0,
+    sel_max: u8 = 0,
+    drum_note: ?u8 = null,
+    data: m4l.MxDeviceData = .{},
+};
+
+const AudioWormhole = struct {
+    sel_min: u8 = 0,
+    sel_max: u8 = 0,
+    midi_note: u8 = 0,
+    data: m4l.MxDeviceData = .{},
+};
+
+const PageAutoTarget = struct {
+    id: u32,
+    sel_offset: u8 = 0,
+    range_min: f64 = 0.0,
+    range_max: f64 = 0.0,
+    has_range: bool = false,
+};
+
+const RawAutoEvent = struct {
+    pointee_id: u32,
+    beat: f64,
+    val: f64,
 };
 
 const MidiDevKind = enum { rack, pitcher, chord, velocity, note_length, arp, random, mx_ext };
@@ -486,6 +536,9 @@ const MidiDev = union(MidiDevKind) {
         gate: f32 = 100.0,
         transpose_steps: u8 = 0,
         transpose_dist: i8 = 12,
+        vel_switch: bool = false,
+        vel_target: u8 = 64,
+        vel_decay_ms: f32 = 1000.0,
     },
     random: struct {
         on: bool = true,
@@ -495,12 +548,14 @@ const MidiDev = union(MidiDevKind) {
         sign: u8 = 0,
         alternate: bool = false,
     },
-    mx_ext: struct { on: bool = true, lom_id: u32 = 0 },
+    mx_ext: m4l.MxDeviceData,
 };
 
 const MidiBranch = struct {
     key_min: u8 = 0,
     key_max: u8 = 127,
+    vel_min: u8 = 0,
+    vel_max: u8 = 127,
     sel_min: u8 = 0,
     sel_max: u8 = 127,
     has_sel: bool = false,
@@ -510,6 +565,7 @@ const MidiBranch = struct {
 
 const MidiRack = struct {
     on: bool = true,
+    sel_offset: u8 = 0,
     branches: std.ArrayList(u32) = .empty, // indices into ParsedAls.midi_branches
 };
 
@@ -539,19 +595,81 @@ const ParsedAls = struct {
     major_version: u16 = 5,
     tempo: f64 = 120.0,
     pad_samples: std.ArrayList(PadMapping) = .empty,
+    mx_instruments: std.ArrayList(MxInstrumentEntry) = .empty,
+    audio_wormholes: std.ArrayList(AudioWormhole) = .empty,
     midi_racks: std.ArrayList(MidiRack) = .empty,
     midi_branches: std.ArrayList(MidiBranch) = .empty,
     light_root_racks: std.ArrayList(LightRootRack) = .empty,
     arr_clips: std.ArrayList(ArrClip) = .empty,
+    fallback_clips: std.ArrayList(ArrClip) = .empty,
+    page_auto_targets: std.ArrayList(PageAutoTarget) = .empty,
+    raw_auto_events: std.ArrayList(RawAutoEvent) = .empty,
+    drum_tracks_seen: u32 = 0,
     max_chain_seen: u8 = 0,
 };
-
-const NoteLayout = enum { user1, programmer };
 
 fn buildProject(a: std.mem.Allocator, files: []const VirtualFile, fallback_title: []const u8) !ConvertedProject {
     const als_file = findAlsFile(files) orelse return error.MissingAlsFile;
     var parsed: ParsedAls = .{};
     try parseAlsGzipStream(a, als_file.bytes, &parsed);
+
+    var hash_cache: m4l.AmxdHashCache = .{};
+    const custom_palette = m4l.findCustomPalette(files);
+
+    // Expand M4L Instrument devices (Dovitate Supersonic & CycleSamples) into PadMappings
+    const prelim_layout = detectLayout(parsed.pad_samples.items);
+    for (parsed.mx_instruments.items) |mxi| {
+        if (!mxi.data.on) continue;
+        const id = m4l.identifyMxDevice(a, &hash_cache, files, mxi.data);
+        switch (id.kind) {
+            .supersonic => {
+                for (mxi.data.drops) |drop| {
+                    if (drop.rel_path.len == 0 and drop.file_name.len == 0) continue;
+                    const slot_id = m4l.firstUintInStr(drop.name) orelse continue;
+                    const prog_idx = m4l.supersonicIdToProgIndex(slot_id) orelse continue;
+                    const note = m4l.progIndexToMidiNote(prelim_layout, prog_idx) orelse continue;
+                    try parsed.pad_samples.append(a, .{
+                        .midi_note = note,
+                        .sel_min = mxi.sel_min,
+                        .sel_max = mxi.sel_max,
+                        .rel_path = drop.rel_path,
+                        .file_name = drop.file_name,
+                        .loop = false,
+                    });
+                }
+            },
+            .cycle_samples => {
+                const drum_note = mxi.drum_note orelse continue;
+                const cs = m4l.parseCycleSamplesSettings(mxi.data);
+                var valid_drops: std.ArrayList(m4l.MxFileDrop) = .empty;
+                defer valid_drops.deinit(a);
+                for (mxi.data.drops) |drop| {
+                    if (drop.rel_path.len > 0 or drop.file_name.len > 0) {
+                        try valid_drops.append(a, drop);
+                    }
+                }
+                const count = @min(valid_drops.items.len, cs.max_items);
+                // Amethyst CycleSamplesAdapter iterates drops in reverse order (slot 1 is last in XML)
+                for (0..count) |i| {
+                    const drop = valid_drops.items[count - 1 - i];
+                    const vk: u8 = @intCast(@min(i, 127));
+                    try parsed.pad_samples.append(a, .{
+                        .midi_note = drum_note,
+                        .sel_min = mxi.sel_min,
+                        .sel_max = mxi.sel_max,
+                        .key_min = vk,
+                        .key_max = vk,
+                        .rel_path = drop.rel_path,
+                        .file_name = drop.file_name,
+                        .loop = false,
+                        .fade_in_ms = cs.fade_in_ms,
+                        .fade_out_ms = cs.fade_out_ms,
+                    });
+                }
+            },
+            else => {},
+        }
+    }
 
     const title = blk: {
         const stem = stemOfPath(als_file.rel_path);
@@ -580,9 +698,11 @@ fn buildProject(a: std.mem.Allocator, files: []const VirtualFile, fallback_title
         }
     }
 
-    // Deduplicate resolved (and optionally trimmed) sound files -> sample_id
+    // Deduplicate resolved (and optionally trimmed/transposed/faded) sound files -> sample_id
     var raw_sounds: std.ArrayList(VirtualFile) = .empty;
     var file_to_id = std.StringHashMapUnmanaged(u32).empty;
+    const DecodedCache = if (is_wasm) void else std.StringHashMapUnmanaged(decode.Sample);
+    var decoded_cache: DecodedCache = if (is_wasm) {} else .empty;
 
     const CellLayer = struct {
         entry: SoundEntry,
@@ -602,16 +722,24 @@ fn buildProject(a: std.mem.Allocator, files: []const VirtualFile, fallback_title
             continue;
         };
 
-        const trimmed = shouldTrimSample(pm, orig_vf);
+        const needs_fx = shouldProcessSample(pm, orig_vf);
         const low_path = try lowerAlloc(a, orig_vf.rel_path);
-        const key = if (trimmed)
-            try std.fmt.allocPrint(a, "{s}#{d}..{d}", .{ low_path, pm.sample_start, pm.sample_end })
+        const key = if (needs_fx)
+            try std.fmt.allocPrint(a, "{s}#{d}..{d}#t{d}#f{d}:{d}#v{d}", .{
+                low_path,
+                pm.sample_start,
+                pm.sample_end,
+                pm.transpose_semitones,
+                @as(i32, @intFromFloat(@round(pm.fade_in_ms))),
+                @as(i32, @intFromFloat(@round(pm.fade_out_ms))),
+                @as(i32, @intFromFloat(@round(pm.volume_db * 10.0))),
+            })
         else
             low_path;
 
         const sample_id: u32 = if (file_to_id.get(key)) |existing| existing else blk: {
-            const vf = if (trimmed)
-                (try trimSampleFile(a, orig_vf, pm.sample_start, pm.sample_end, pm.default_sample_rate)) orelse orig_vf
+            const vf = if (needs_fx)
+                (try processSampleFile(a, orig_vf, low_path, pm, &decoded_cache)) orelse orig_vf
             else
                 orig_vf;
             const id: u32 = @intCast(raw_sounds.items.len);
@@ -649,7 +777,6 @@ fn buildProject(a: std.mem.Allocator, files: []const VirtualFile, fallback_title
     }
 
     // Pass 2: Fallback for missing Ableton Core Library drum samples (e.g. uncollected Kick-LD / Snare-909).
-    // Uses embedded Public Domain LinnDrum LM-2 & GPLv2+ LMMS one-shots matched by machine/drum type.
     for (missing_samples.items) |pm| {
         const xy = midiNoteToXY(layout, pm.midi_note) orelse continue;
         const asset = drums_bank.lookup(pm.rel_path, pm.file_name) orelse {
@@ -672,7 +799,6 @@ fn buildProject(a: std.mem.Allocator, files: []const VirtualFile, fallback_title
         var ch: u8 = c_min;
         while (ch <= c_max) : (ch += 1) {
             const ci = (@as(usize, ch) * 8 + xy[0]) * 8 + xy[1];
-            // Only fill empty cells so we don't duplicate pads that already have a real bundled layer.
             if (sound_lists[ci].items.len == 0) {
                 try sound_lists[ci].append(a, .{
                     .entry = .{
@@ -687,24 +813,94 @@ fn buildProject(a: std.mem.Allocator, files: []const VirtualFile, fallback_title
         }
     }
 
-    // Pass 3: Partition each cell by overlapping KeyRange.
-    // - Overlapping KeyRanges (e.g. sibling InstrumentBranches all 0..127) play simultaneously -> mix WAVs into 1 entry.
-    // - Disjoint KeyRanges (e.g. MidiRandom Alternate 60..60, 61..61, ...) cycle sequentially -> keep separate keySound entries.
+    // Collect wormhole targets per cell (from audio track M4L devices + light track M4L devices)
+    const wormholes = try a.alloc(?u8, total_cells);
+    @memset(wormholes, null);
+    for (parsed.audio_wormholes.items) |aw| {
+        const xy = midiNoteToXY(layout, aw.midi_note) orelse continue;
+        const id = m4l.identifyMxDevice(a, &hash_cache, files, aw.data);
+        const target = m4l.extractWormholeTarget(id.kind, aw.data) orelse continue;
+        if (target >= chain_count) continue;
+        const c_min = @min(aw.sel_min, chain_count - 1);
+        const c_max = @min(aw.sel_max, chain_count - 1);
+        var ch: u8 = c_min;
+        while (ch <= c_max) : (ch += 1) {
+            wormholes[(@as(usize, ch) * 8 + xy[0]) * 8 + xy[1]] = target;
+        }
+    }
+
+    // Simulate MIDI Effect Rack lightshows (including all Amethyst M4L devices + MIDIext + MidiRandom)
+    const led_cells = try a.alloc([]const LedCellAnim, total_cells);
+    for (led_cells) |*c_evs| c_evs.* = &.{};
+
+    if (parsed.light_root_racks.items.len > 0) {
+        var midiext = try buildMidiExtCtx(a, files, &parsed, &hash_cache);
+        const beat_ms = 60000.0 / std.math.clamp(parsed.tempo, 20.0, 400.0);
+        for (0..chain_count) |ch_usize| {
+            const ch: u8 = @intCast(ch_usize);
+            for (0..8) |r_u| {
+                for (0..8) |col_u| {
+                    const row: u8 = @intCast(r_u);
+                    const col: u8 = @intCast(col_u);
+                    const trig_note = xyToMidiNote(layout, row, col);
+                    const ci = (ch_usize * 8 + r_u) * 8 + col_u;
+                    var light_wh: ?u8 = null;
+                    const anims = try simulatePadLights(
+                        a,
+                        &parsed,
+                        &midiext,
+                        &hash_cache,
+                        files,
+                        custom_palette,
+                        layout,
+                        beat_ms,
+                        ch,
+                        trig_note,
+                        &light_wh,
+                    );
+                    led_cells[ci] = anims;
+                    if (light_wh) |tw| {
+                        if (tw < chain_count and wormholes[ci] == null) wormholes[ci] = tw;
+                    }
+                }
+            }
+        }
+    }
+
+    // Pass 3: Partition each cell by overlapping KeyRange & attach wormholes.
     const sound_cells = try a.alloc([]const SoundEntry, total_cells);
     var group_buf: std.ArrayList(SoundEntry) = .empty;
     defer group_buf.deinit(a);
     var used_buf: std.ArrayList(bool) = .empty;
     defer used_buf.deinit(a);
+    var silent_sample_id: ?u32 = null;
 
     for (0..total_cells) |ci| {
         const layers = sound_lists[ci].items;
+        const cell_wh = wormholes[ci];
         if (layers.len == 0) {
-            sound_cells[ci] = &.{};
+            if (cell_wh) |wh| {
+                // Wormhole-only pad: attach a tiny 1-sample silent WAV so UniPack keySound triggers chain switch!
+                const sid = silent_sample_id orelse blk: {
+                    const silent_pcm = [_]f32{ 0.0, 0.0 };
+                    const silent_wav = try encodeStereoPcm16Wav(a, &silent_pcm, 44100);
+                    const new_id: u32 = @intCast(raw_sounds.items.len);
+                    try raw_sounds.append(a, .{ .rel_path = "wormhole_silent.wav", .bytes = silent_wav });
+                    silent_sample_id = new_id;
+                    break :blk new_id;
+                };
+                const one = try a.alloc(SoundEntry, 1);
+                one[0] = .{ .sample_id = sid, .loop = 0, .wormhole = wh };
+                sound_cells[ci] = one;
+            } else {
+                sound_cells[ci] = &.{};
+            }
             continue;
         }
         if (layers.len == 1) {
             const one = try a.alloc(SoundEntry, 1);
             one[0] = layers[0].entry;
+            one[0].wormhole = cell_wh;
             sound_cells[ci] = one;
             continue;
         }
@@ -743,40 +939,25 @@ fn buildProject(a: std.mem.Allocator, files: []const VirtualFile, fallback_title
                     try cell_out.append(a, .{
                         .sample_id = mixed_id,
                         .loop = if (any_loop) -1 else 0,
-                        .wormhole = null,
+                        .wormhole = cell_wh,
                     });
                 } else {
-                    try cell_out.appendSlice(a, group_buf.items);
+                    for (group_buf.items) |se| {
+                        var copy = se;
+                        copy.wormhole = cell_wh;
+                        try cell_out.append(a, copy);
+                    }
                 }
             } else {
-                try cell_out.append(a, group_buf.items[0]);
+                var copy = group_buf.items[0];
+                copy.wormhole = cell_wh;
+                try cell_out.append(a, copy);
             }
         }
         sound_cells[ci] = cell_out.items;
     }
 
-    // Simulate MIDI Effect Rack lightshows (including MIDI Extension 0save + .mid and MidiRandom multi-press)
-    const led_cells = try a.alloc([]const []const LedEvent, total_cells);
-    for (led_cells) |*c_evs| c_evs.* = &.{};
-
-    if (parsed.light_root_racks.items.len > 0) {
-        var midiext = try buildMidiExtCtx(a, files);
-        const beat_ms = 60000.0 / std.math.clamp(parsed.tempo, 20.0, 400.0);
-        for (0..chain_count) |ch_usize| {
-            const ch: u8 = @intCast(ch_usize);
-            for (0..8) |r_u| {
-                for (0..8) |col_u| {
-                    const row: u8 = @intCast(r_u);
-                    const col: u8 = @intCast(col_u);
-                    const trig_note = xyToMidiNote(layout, row, col);
-                    const anims = try simulatePadLights(a, &parsed, &midiext, layout, beat_ms, ch, trig_note);
-                    led_cells[(ch_usize * 8 + r_u) * 8 + col_u] = anims;
-                }
-            }
-        }
-    }
-
-    // Build AutoPlay from Arrangement MidiClips
+    // Build AutoPlay from Arrangement MidiClips + Page Automation Envelopes
     const auto_play = try buildAutoPlay(a, &parsed, layout, chain_count);
 
     return .{
@@ -814,6 +995,12 @@ const Tag = enum(u8) {
     sample_ref,
     default_duration,
     default_sample_rate,
+    transpose_key,
+    volume_and_pan,
+    volume,
+    one_shot_envelope,
+    fade_in_time,
+    fade_out_time,
     file_ref,
     relative_path,
     relative_path_element,
@@ -822,13 +1009,42 @@ const Tag = enum(u8) {
     midi_effect_group_device,
     midi_effect_branch,
     key_range,
+    velocity_range,
     mixer_device,
+    mixer,
     speaker,
+    main_sequencer,
+    monitoring_enum,
+    is_armed,
+    chain_selector,
+    midi_controller_range,
+    key_midi,
+    channel,
+    note_or_controller,
+    macro_0,
+    macro_1,
+    macro_2,
+    macro_3,
+    macro_4,
+    macro_5,
+    macro_6,
+    macro_7,
+    macro_8,
+    macro_9,
+    macro_10,
+    macro_11,
+    macro_12,
+    macro_13,
+    macro_14,
+    macro_15,
     midi_pitcher,
     midi_chord,
     midi_velocity,
     midi_note_length,
     midi_arpeggiator,
+    velocity_switch,
+    velocity_target,
+    velocity_decay,
     midi_random,
     chance,
     choices,
@@ -836,6 +1052,20 @@ const Tag = enum(u8) {
     sign,
     alternate,
     mx_device_midi_effect,
+    mx_device_instrument,
+    patch_slot,
+    mx_patch_ref,
+    blob_slot,
+    mx_d_blob,
+    blob,
+    parameter_list,
+    mx_d_float_param,
+    mx_d_int_param,
+    mx_d_enum_param,
+    index,
+    timeable,
+    file_drop_list,
+    mx_d_full_file_drop,
     lom_id,
     on,
     pitch,
@@ -869,6 +1099,16 @@ const Tag = enum(u8) {
     transpose_distance,
     clip_timeable,
     arranger_automation,
+    automation_target,
+    automation_envelopes,
+    automation_envelope,
+    envelope_target,
+    pointee_id,
+    automation,
+    events,
+    float_event,
+    bool_event,
+    enum_event,
     midi_clip,
     current_start,
     current_end,
@@ -905,6 +1145,12 @@ const tag_map = std.StaticStringMap(Tag).initComptime(.{
     .{ "SampleRef", .sample_ref },
     .{ "DefaultDuration", .default_duration },
     .{ "DefaultSampleRate", .default_sample_rate },
+    .{ "TransposeKey", .transpose_key },
+    .{ "VolumeAndPan", .volume_and_pan },
+    .{ "Volume", .volume },
+    .{ "OneShotEnvelope", .one_shot_envelope },
+    .{ "FadeInTime", .fade_in_time },
+    .{ "FadeOutTime", .fade_out_time },
     .{ "FileRef", .file_ref },
     .{ "RelativePath", .relative_path },
     .{ "RelativePathElement", .relative_path_element },
@@ -913,13 +1159,42 @@ const tag_map = std.StaticStringMap(Tag).initComptime(.{
     .{ "MidiEffectGroupDevice", .midi_effect_group_device },
     .{ "MidiEffectBranch", .midi_effect_branch },
     .{ "KeyRange", .key_range },
+    .{ "VelocityRange", .velocity_range },
     .{ "MixerDevice", .mixer_device },
+    .{ "Mixer", .mixer },
     .{ "Speaker", .speaker },
+    .{ "MainSequencer", .main_sequencer },
+    .{ "MonitoringEnum", .monitoring_enum },
+    .{ "IsArmed", .is_armed },
+    .{ "ChainSelector", .chain_selector },
+    .{ "MidiControllerRange", .midi_controller_range },
+    .{ "KeyMidi", .key_midi },
+    .{ "Channel", .channel },
+    .{ "NoteOrController", .note_or_controller },
+    .{ "MacroControls.0", .macro_0 },
+    .{ "MacroControls.1", .macro_1 },
+    .{ "MacroControls.2", .macro_2 },
+    .{ "MacroControls.3", .macro_3 },
+    .{ "MacroControls.4", .macro_4 },
+    .{ "MacroControls.5", .macro_5 },
+    .{ "MacroControls.6", .macro_6 },
+    .{ "MacroControls.7", .macro_7 },
+    .{ "MacroControls.8", .macro_8 },
+    .{ "MacroControls.9", .macro_9 },
+    .{ "MacroControls.10", .macro_10 },
+    .{ "MacroControls.11", .macro_11 },
+    .{ "MacroControls.12", .macro_12 },
+    .{ "MacroControls.13", .macro_13 },
+    .{ "MacroControls.14", .macro_14 },
+    .{ "MacroControls.15", .macro_15 },
     .{ "MidiPitcher", .midi_pitcher },
     .{ "MidiChord", .midi_chord },
     .{ "MidiVelocity", .midi_velocity },
     .{ "MidiNoteLength", .midi_note_length },
     .{ "MidiArpeggiator", .midi_arpeggiator },
+    .{ "VelocitySwitch", .velocity_switch },
+    .{ "VelocityTarget", .velocity_target },
+    .{ "VelocityDecay", .velocity_decay },
     .{ "MidiRandom", .midi_random },
     .{ "Chance", .chance },
     .{ "Choices", .choices },
@@ -927,6 +1202,21 @@ const tag_map = std.StaticStringMap(Tag).initComptime(.{
     .{ "Sign", .sign },
     .{ "Alternate", .alternate },
     .{ "MxDeviceMidiEffect", .mx_device_midi_effect },
+    .{ "MxDeviceInstrument", .mx_device_instrument },
+    .{ "PatchSlot", .patch_slot },
+    .{ "MxDPatchRef", .mx_patch_ref },
+    .{ "MxPatchRef", .mx_patch_ref },
+    .{ "BlobSlot", .blob_slot },
+    .{ "MxDBlob", .mx_d_blob },
+    .{ "Blob", .blob },
+    .{ "ParameterList", .parameter_list },
+    .{ "MxDFloatParameter", .mx_d_float_param },
+    .{ "MxDIntParameter", .mx_d_int_param },
+    .{ "MxDEnumParameter", .mx_d_enum_param },
+    .{ "Index", .index },
+    .{ "Timeable", .timeable },
+    .{ "FileDropList", .file_drop_list },
+    .{ "MxDFullFileDrop", .mx_d_full_file_drop },
     .{ "LomId", .lom_id },
     .{ "On", .on },
     .{ "Pitch", .pitch },
@@ -960,6 +1250,16 @@ const tag_map = std.StaticStringMap(Tag).initComptime(.{
     .{ "TransposeDistance", .transpose_distance },
     .{ "ClipTimeable", .clip_timeable },
     .{ "ArrangerAutomation", .arranger_automation },
+    .{ "AutomationTarget", .automation_target },
+    .{ "AutomationEnvelopes", .automation_envelopes },
+    .{ "AutomationEnvelope", .automation_envelope },
+    .{ "EnvelopeTarget", .envelope_target },
+    .{ "PointeeId", .pointee_id },
+    .{ "Automation", .automation },
+    .{ "Events", .events },
+    .{ "FloatEvent", .float_event },
+    .{ "BoolEvent", .bool_event },
+    .{ "EnumEvent", .enum_event },
     .{ "MidiClip", .midi_clip },
     .{ "CurrentStart", .current_start },
     .{ "CurrentEnd", .current_end },
@@ -978,6 +1278,8 @@ const tag_map = std.StaticStringMap(Tag).initComptime(.{
 
 const InstBranchFrame = struct {
     sample_start: usize = 0,
+    wh_start: usize = 0,
+    mxi_start: usize = 0,
     sel_min: u8 = 0,
     sel_max: u8 = 0,
     key_min: u8 = 0,
@@ -985,28 +1287,63 @@ const InstBranchFrame = struct {
     muted: bool = false,
 };
 
+fn tagToMacroIndex(tag: Tag) ?u4 {
+    const first = @intFromEnum(Tag.macro_0);
+    const last = @intFromEnum(Tag.macro_15);
+    const v = @intFromEnum(tag);
+    if (v >= first and v <= last) return @intCast(v - first);
+    return null;
+}
+
+fn hexNibble(ch: u8) ?u4 {
+    if (ch >= '0' and ch <= '9') return @intCast(ch - '0');
+    if (ch >= 'a' and ch <= 'f') return @intCast(ch - 'a' + 10);
+    if (ch >= 'A' and ch <= 'F') return @intCast(ch - 'A' + 10);
+    return null;
+}
+
 const ParserState = struct {
     a: std.mem.Allocator,
     out: *ParsedAls,
 
     stack: [192]Tag = @splat(.other),
     depth: usize = 0,
+    manual_depth: usize = 0,
 
     // Context flags
     in_master: bool = false,
     in_midi_track: bool = false,
     in_return_track: bool = false,
     track_has_drum: bool = false,
+    in_main_sequencer: bool = false,
+    track_has_monitoring: bool = false,
+    track_monitoring: u8 = 0,
+    track_armed: bool = false,
+    track_muted: bool = false,
+    track_sample_start: usize = 0,
+    track_mxi_start: usize = 0,
+    track_wh_start: usize = 0,
 
     // Sample extraction state (DrumGroup -> DrumBranch -> [InstrumentBranch...] -> Simpler)
     in_drum_group: bool = false,
     in_drum_branch: bool = false,
     drum_branch_muted: bool = false,
     drum_branch_sample_start: usize = 0,
+    drum_branch_wh_start: usize = 0,
+    drum_branch_mxi_start: usize = 0,
+    drum_branch_reverse_multi: bool = false,
+    in_audio_random: bool = false,
+    audio_rnd_on: bool = true,
+    audio_rnd_alt: bool = false,
+    audio_rnd_chance: f32 = 0.0,
+    audio_rnd_sign: u8 = 0,
     cur_drum_note: u8 = 0,
     has_drum_note: bool = false,
     inst_stack: [8]InstBranchFrame = @splat(.{}),
     inst_depth: usize = 0,
+    inst_group_depth: usize = 0,
+    outer_inst_sel_offset: u8 = 0,
+    outer_inst_sample_start: usize = 0,
     in_simpler: bool = false,
     in_sample_ref: bool = false,
     in_sample_file_ref: bool = false,
@@ -1016,22 +1353,64 @@ const ParserState = struct {
     simpler_end: u64 = 0,
     simpler_default_dur: u64 = 0,
     simpler_default_sr: u32 = 0,
+    simpler_transpose: i8 = 0,
+    simpler_volume_db: f32 = 0.0,
+    simpler_fade_in_ms: f32 = 0.0,
+    simpler_fade_out_ms: f32 = 0.0,
     simpler_rel: std.ArrayList(u8) = .empty,
     simpler_name: []const u8 = "",
 
-    // Recursive MIDI Effect Rack state
+    // Recursive MIDI Effect Rack state + Macro mapping (AbletonMacroMapping)
     rack_stack: [32]u32 = undefined,
+    rack_macros: [32][16]f32 = @splat(@splat(0.0)),
+    rack_has_macro: [32][16]bool = @splat(@splat(false)),
     rack_depth: usize = 0,
     branch_stack: [32]u32 = undefined,
     branch_depth: usize = 0,
     active_dev_branch: ?u32 = null,
     active_dev_idx: usize = 0,
     active_dev_tag: Tag = .other,
+    cur_keymidi_macro: ?u4 = null,
+    cur_keymidi_ch: i32 = 0,
+    cur_keymidi_nc: ?u4 = null,
+    cur_keymidi_depth: usize = 0,
+    macro_mapped_depth: usize = 0,
+    cur_mcr_min: f64 = 0.0,
+    cur_mcr_max: f64 = 127.0,
+    cur_mcr_has_min: bool = false,
+    cur_mcr_has_max: bool = false,
+
+    // Full Max for Live (MxDeviceMidiEffect / MxDeviceInstrument) builder state
+    in_mx: bool = false,
+    mx_is_instrument: bool = false,
+    mx_in_audio_drum: bool = false,
+    mx_on: bool = true,
+    mx_lom_id: u32 = 0,
+    in_mx_patch_slot: bool = false,
+    in_mx_patch_ref: bool = false,
+    mx_patch_rel: std.ArrayList(u8) = .empty,
+    mx_patch_name: []const u8 = "",
+    in_mx_blob_slot: bool = false,
+    in_mx_blob: bool = false,
+    mx_blob_buf: std.ArrayList(u8) = .empty,
+    mx_blob_hi_nibble: ?u4 = null,
+    in_mx_param_list: bool = false,
+    in_mx_param: bool = false,
+    cur_mx_param: m4l.MxParam = .{},
+    mx_params: std.ArrayList(m4l.MxParam) = .empty,
+    in_mx_file_drop: bool = false,
+    in_mx_drop_item: bool = false,
+    cur_drop_name: []const u8 = "",
+    in_mx_file_ref: bool = false,
+    mx_rel: std.ArrayList(u8) = .empty,
+    mx_name: []const u8 = "",
+    mx_drops: std.ArrayList(m4l.MxFileDrop) = .empty,
+
     track_light_mode: LightMode = .static,
     track_legacy_rg: bool = false,
     track_root_racks: std.ArrayList(u32) = .empty,
 
-    // Arrangement MidiClip state
+    // Arrangement MidiClip + AutomationEnvelope state
     in_clip_timeable: bool = false,
     in_arranger_auto: bool = false,
     in_midi_clip: bool = false,
@@ -1040,6 +1419,76 @@ const ParserState = struct {
     clip_keytrack_start: usize = 0,
     has_clip_key: bool = false,
     track_clips: std.ArrayList(ArrClip) = .empty,
+    in_auto_envelopes: bool = false,
+    in_auto_envelope: bool = false,
+    cur_env_target_id: ?u32 = null,
+    cur_env_in_events: bool = false,
+
+    fn beginMx(s: *ParserState, is_inst: bool, in_audio_drum: bool) void {
+        s.in_mx = true;
+        s.mx_is_instrument = is_inst;
+        s.mx_in_audio_drum = in_audio_drum;
+        s.mx_on = true;
+        s.mx_lom_id = 0;
+        s.in_mx_patch_slot = false;
+        s.in_mx_patch_ref = false;
+        s.mx_patch_rel.clearRetainingCapacity();
+        s.mx_patch_name = "";
+        s.in_mx_blob_slot = false;
+        s.in_mx_blob = false;
+        s.mx_blob_buf.clearRetainingCapacity();
+        s.mx_blob_hi_nibble = null;
+        s.in_mx_param_list = false;
+        s.in_mx_param = false;
+        s.cur_mx_param = .{};
+        s.mx_params.clearRetainingCapacity();
+        s.in_mx_file_drop = false;
+        s.in_mx_drop_item = false;
+        s.cur_drop_name = "";
+        s.in_mx_file_ref = false;
+        s.mx_rel.clearRetainingCapacity();
+        s.mx_name = "";
+        s.mx_drops.clearRetainingCapacity();
+    }
+
+    fn finishMxData(s: *ParserState) m4l.MxDeviceData {
+        // Trim trailing NUL bytes from decoded Max JSON blobs
+        var blob_end = s.mx_blob_buf.items.len;
+        while (blob_end > 0 and s.mx_blob_buf.items[blob_end - 1] == 0) : (blob_end -= 1) {}
+        const blob_copy = if (blob_end > 0) (s.a.dupe(u8, s.mx_blob_buf.items[0..blob_end]) catch "") else "";
+        const patch_rel_copy = if (s.mx_patch_rel.items.len > 0) (s.a.dupe(u8, s.mx_patch_rel.items) catch "") else "";
+        const params_copy = if (s.mx_params.items.len > 0) (s.a.dupe(m4l.MxParam, s.mx_params.items) catch &.{}) else &.{};
+        const drops_copy = if (s.mx_drops.items.len > 0) (s.a.dupe(m4l.MxFileDrop, s.mx_drops.items) catch &.{}) else &.{};
+        const first_rel: []const u8 = if (drops_copy.len > 0) drops_copy[0].rel_path else "";
+        const first_name: []const u8 = if (drops_copy.len > 0) drops_copy[0].file_name else "";
+        return .{
+            .on = s.mx_on,
+            .lom_id = s.mx_lom_id,
+            .patch_rel = patch_rel_copy,
+            .patch_name = s.mx_patch_name,
+            .blob = blob_copy,
+            .params = params_copy,
+            .drops = drops_copy,
+            .mid_rel = first_rel,
+            .mid_name = first_name,
+        };
+    }
+
+    fn onBlobText(s: *ParserState, txt: []const u8) !void {
+        if (!s.in_mx_blob) return;
+        const max_blob_bytes: usize = 131072;
+        for (txt) |ch| {
+            if (s.mx_blob_buf.items.len >= max_blob_bytes) return;
+            const nib = hexNibble(ch) orelse continue;
+            if (s.mx_blob_hi_nibble) |hi| {
+                const byte: u8 = (@as(u8, hi) << 4) | @as(u8, nib);
+                try s.mx_blob_buf.append(s.a, byte);
+                s.mx_blob_hi_nibble = null;
+            } else {
+                s.mx_blob_hi_nibble = nib;
+            }
+        }
+    }
 
     fn parentTag(s: *const ParserState) Tag {
         return if (s.depth > 0) s.stack[s.depth - 1] else .other;
@@ -1064,11 +1513,46 @@ const ParserState = struct {
             .return_track => s.in_return_track = true,
             .midi_track => {
                 s.in_midi_track = true;
+                s.in_main_sequencer = false;
                 s.track_has_drum = false;
+                s.track_has_monitoring = false;
+                s.track_monitoring = 0;
+                s.track_armed = false;
+                s.track_muted = false;
+                s.track_sample_start = s.out.pad_samples.items.len;
+                s.track_mxi_start = s.out.mx_instruments.items.len;
+                s.track_wh_start = s.out.audio_wormholes.items.len;
                 s.track_light_mode = .static;
                 s.track_legacy_rg = false;
                 s.track_root_racks.clearRetainingCapacity();
                 s.track_clips.clearRetainingCapacity();
+            },
+            .main_sequencer => {
+                if (s.in_midi_track and !s.in_return_track) s.in_main_sequencer = true;
+            },
+            .monitoring_enum => {
+                if (s.in_main_sequencer) {
+                    if (attrInt(attrs, "Value")) |v| {
+                        s.track_has_monitoring = true;
+                        s.track_monitoring = @intCast(std.math.clamp(v, 0, 2));
+                    }
+                }
+            },
+            .is_armed => {
+                if (s.in_main_sequencer) {
+                    if (attrStr(attrs, "Value")) |v| {
+                        s.track_armed = std.mem.eql(u8, v, "true");
+                    }
+                }
+            },
+            .instrument_group_device => {
+                if (s.in_midi_track and !s.in_return_track) {
+                    if (s.inst_group_depth == 0) {
+                        s.outer_inst_sel_offset = 0;
+                        s.outer_inst_sample_start = s.out.pad_samples.items.len;
+                    }
+                    s.inst_group_depth += 1;
+                }
             },
             .drum_group_device => {
                 if (s.in_midi_track) {
@@ -1081,6 +1565,9 @@ const ParserState = struct {
                     s.in_drum_branch = true;
                     s.drum_branch_muted = false;
                     s.drum_branch_sample_start = s.out.pad_samples.items.len;
+                    s.drum_branch_wh_start = s.out.audio_wormholes.items.len;
+                    s.drum_branch_mxi_start = s.out.mx_instruments.items.len;
+                    s.drum_branch_reverse_multi = false;
                     s.has_drum_note = false;
                     s.cur_drum_note = 0;
                 }
@@ -1100,6 +1587,8 @@ const ParserState = struct {
                 if (s.in_midi_track and !s.in_return_track and s.inst_depth < s.inst_stack.len) {
                     s.inst_stack[s.inst_depth] = .{
                         .sample_start = s.out.pad_samples.items.len,
+                        .wh_start = s.out.audio_wormholes.items.len,
+                        .mxi_start = s.out.mx_instruments.items.len,
                     };
                     s.inst_depth += 1;
                 }
@@ -1115,6 +1604,10 @@ const ParserState = struct {
                     s.simpler_end = 0;
                     s.simpler_default_dur = 0;
                     s.simpler_default_sr = 0;
+                    s.simpler_transpose = 0;
+                    s.simpler_volume_db = 0.0;
+                    s.simpler_fade_in_ms = 0.0;
+                    s.simpler_fade_out_ms = 0.0;
                     s.simpler_rel.clearRetainingCapacity();
                     s.simpler_name = "";
                 }
@@ -1145,14 +1638,33 @@ const ParserState = struct {
                 }
             },
             .file_ref => {
-                if (s.in_sample_ref and parent == .sample_ref) s.in_sample_file_ref = true;
+                if (s.in_sample_ref and parent == .sample_ref) {
+                    s.in_sample_file_ref = true;
+                } else if (s.in_mx and s.in_mx_patch_slot and parent == .mx_patch_ref) {
+                    s.in_mx_patch_ref = true;
+                    s.mx_patch_rel.clearRetainingCapacity();
+                    s.mx_patch_name = "";
+                } else if (s.in_mx and s.in_mx_file_drop) {
+                    s.in_mx_file_ref = true;
+                    s.mx_rel.clearRetainingCapacity();
+                    s.mx_name = "";
+                }
             },
             .relative_path => {
-                // Live 9/10 uses child <RelativePathElement Dir="..."/>; Live 11/12 uses Value="..."
                 if (s.in_sample_file_ref and parent == .file_ref) {
                     s.simpler_rel.clearRetainingCapacity();
                     if (attrStr(attrs, "Value")) |v| {
                         if (v.len > 0) try appendUnescaped(s.a, &s.simpler_rel, v);
+                    }
+                } else if (s.in_mx_patch_ref and parent == .file_ref) {
+                    s.mx_patch_rel.clearRetainingCapacity();
+                    if (attrStr(attrs, "Value")) |v| {
+                        if (v.len > 0) try appendUnescaped(s.a, &s.mx_patch_rel, v);
+                    }
+                } else if (s.in_mx_file_ref and parent == .file_ref) {
+                    s.mx_rel.clearRetainingCapacity();
+                    if (attrStr(attrs, "Value")) |v| {
+                        if (v.len > 0) try appendUnescaped(s.a, &s.mx_rel, v);
                     }
                 }
             },
@@ -1162,6 +1674,20 @@ const ParserState = struct {
                         if (dir.len > 0) {
                             if (s.simpler_rel.items.len > 0) try s.simpler_rel.append(s.a, '/');
                             try appendUnescaped(s.a, &s.simpler_rel, dir);
+                        }
+                    }
+                } else if (s.in_mx_patch_ref and parent == .relative_path) {
+                    if (attrStr(attrs, "Dir")) |dir| {
+                        if (dir.len > 0) {
+                            if (s.mx_patch_rel.items.len > 0) try s.mx_patch_rel.append(s.a, '/');
+                            try appendUnescaped(s.a, &s.mx_patch_rel, dir);
+                        }
+                    }
+                } else if (s.in_mx_file_ref and parent == .relative_path) {
+                    if (attrStr(attrs, "Dir")) |dir| {
+                        if (dir.len > 0) {
+                            if (s.mx_rel.items.len > 0) try s.mx_rel.append(s.a, '/');
+                            try appendUnescaped(s.a, &s.mx_rel, dir);
                         }
                     }
                 }
@@ -1182,6 +1708,8 @@ const ParserState = struct {
                         try s.track_root_racks.append(s.a, ridx);
                     }
                     s.rack_stack[s.rack_depth] = ridx;
+                    s.rack_macros[s.rack_depth] = @splat(0.0);
+                    s.rack_has_macro[s.rack_depth] = @splat(false);
                     s.rack_depth += 1;
                     s.active_dev_tag = .midi_effect_group_device;
                 }
@@ -1201,17 +1729,148 @@ const ParserState = struct {
             .midi_velocity => try s.pushMidiDev(.{ .velocity = .{} }, .midi_velocity),
             .midi_note_length => try s.pushMidiDev(.{ .note_length = .{} }, .midi_note_length),
             .midi_arpeggiator => try s.pushMidiDev(.{ .arp = .{} }, .midi_arpeggiator),
-            .midi_random => try s.pushMidiDev(.{ .random = .{} }, .midi_random),
-            .mx_device_midi_effect => try s.pushMidiDev(.{ .mx_ext = .{} }, .mx_device_midi_effect),
+            .midi_random => {
+                if (s.branch_depth > 0) {
+                    try s.pushMidiDev(.{ .random = .{} }, .midi_random);
+                } else if (s.in_drum_branch) {
+                    s.in_audio_random = true;
+                    s.audio_rnd_on = true;
+                    s.audio_rnd_alt = false;
+                    s.audio_rnd_chance = 0.0;
+                    s.audio_rnd_sign = 0;
+                }
+            },
+            .mx_device_midi_effect => {
+                if (s.branch_depth > 0) {
+                    try s.pushMidiDev(.{ .mx_ext = .{} }, .mx_device_midi_effect);
+                    s.beginMx(false, false);
+                } else if (s.in_midi_track and !s.in_return_track and s.in_drum_branch) {
+                    s.beginMx(false, true);
+                }
+            },
+            .mx_device_instrument => {
+                if (s.in_midi_track and !s.in_return_track) {
+                    s.track_has_drum = true;
+                    s.beginMx(true, s.in_drum_branch);
+                }
+            },
+            .patch_slot => {
+                if (s.in_mx) s.in_mx_patch_slot = true;
+            },
+            .blob_slot => {
+                if (s.in_mx) s.in_mx_blob_slot = true;
+            },
+            .blob => {
+                if (s.in_mx and s.in_mx_blob_slot and !self_closing) {
+                    s.in_mx_blob = true;
+                    s.mx_blob_buf.clearRetainingCapacity();
+                    s.mx_blob_hi_nibble = null;
+                }
+            },
+            .parameter_list => {
+                if (s.in_mx) s.in_mx_param_list = true;
+            },
+            .mx_d_float_param, .mx_d_int_param, .mx_d_enum_param => {
+                if (s.in_mx and s.in_mx_param_list) {
+                    s.in_mx_param = true;
+                    s.cur_mx_param = .{
+                        .kind = switch (tag) {
+                            .mx_d_float_param => .float,
+                            .mx_d_int_param => .int,
+                            else => .enum_v,
+                        },
+                    };
+                }
+            },
+            .index => {
+                if (s.in_mx and s.in_mx_param) {
+                    if (attrInt(attrs, "Value")) |iv| {
+                        if (iv >= 0 and iv <= 65535) s.cur_mx_param.index = @intCast(iv);
+                    }
+                }
+            },
+            .file_drop_list => {
+                if (s.in_mx) s.in_mx_file_drop = true;
+            },
+            .mx_d_full_file_drop => {
+                if (s.in_mx and s.in_mx_file_drop) {
+                    s.in_mx_drop_item = true;
+                    s.cur_drop_name = "";
+                    s.mx_rel.clearRetainingCapacity();
+                    s.mx_name = "";
+                }
+            },
             .lom_id => {
-                if (parent == .mx_device_midi_effect and s.active_dev_tag == .mx_device_midi_effect) {
-                    if (s.active_dev_branch) |bidx| {
-                        if (attrInt(attrs, "Value")) |v| {
-                            if (v > 0) {
-                                s.out.midi_branches.items[bidx].devs.items[s.active_dev_idx].mx_ext.lom_id = @intCast(v);
+                if (s.in_mx and (parent == .mx_device_midi_effect or parent == .mx_device_instrument)) {
+                    if (attrInt(attrs, "Value")) |v| {
+                        if (v > 0) s.mx_lom_id = @intCast(v);
+                    }
+                }
+            },
+            .key_midi => {
+                s.cur_keymidi_ch = 0;
+                s.cur_keymidi_nc = null;
+                s.cur_keymidi_macro = null;
+                s.cur_keymidi_depth = s.depth;
+            },
+            .channel => {
+                if (parent == .key_midi) {
+                    if (attrInt(attrs, "Value")) |ch| s.cur_keymidi_ch = ch;
+                }
+            },
+            .note_or_controller => {
+                if (parent == .key_midi) {
+                    if (attrInt(attrs, "Value")) |nc| {
+                        if (nc >= 0 and nc < 16) s.cur_keymidi_nc = @intCast(nc);
+                    }
+                }
+            },
+            .midi_controller_range => {
+                s.cur_mcr_has_min = false;
+                s.cur_mcr_has_max = false;
+                s.cur_mcr_min = 0.0;
+                s.cur_mcr_max = 127.0;
+            },
+            .automation_target => {
+                if (s.in_midi_track and !s.in_return_track) {
+                    const is_page_ctrl = (parent == .chain_selector and ((s.rack_depth == 1 and s.branch_depth == 0) or (s.inst_group_depth == 1 and s.inst_depth == 0 and !s.in_drum_group))) or
+                        (parent == .macro_0 and ((s.rack_depth == 1 and s.branch_depth == 0) or (s.inst_group_depth == 1 and s.inst_depth == 0 and !s.in_drum_group)));
+                    if (is_page_ctrl) {
+                        if (attrInt(attrs, "Id")) |idv| {
+                            if (idv > 0) {
+                                const off: u8 = if (s.rack_depth == 1)
+                                    s.out.midi_racks.items[s.rack_stack[0]].sel_offset
+                                else
+                                    s.outer_inst_sel_offset;
+                                try s.out.page_auto_targets.append(s.a, .{
+                                    .id = @intCast(idv),
+                                    .sel_offset = off,
+                                });
                             }
                         }
                     }
+                }
+            },
+            .automation_envelopes => {
+                if (s.in_midi_track and !s.in_return_track) s.in_auto_envelopes = true;
+            },
+            .automation_envelope => {
+                if (s.in_auto_envelopes) {
+                    s.in_auto_envelope = true;
+                    s.cur_env_target_id = null;
+                    s.cur_env_in_events = false;
+                }
+            },
+            .pointee_id => {
+                if (s.in_auto_envelope and parent == .envelope_target) {
+                    if (attrInt(attrs, "Value")) |idv| {
+                        if (idv > 0) s.cur_env_target_id = @intCast(idv);
+                    }
+                }
+            },
+            .events => {
+                if (s.in_auto_envelope and parent == .automation) {
+                    s.cur_env_in_events = true;
                 }
             },
 
@@ -1271,6 +1930,38 @@ const ParserState = struct {
                             s.simpler_name = tmp.items;
                         }
                     }
+                } else if (s.in_mx_patch_ref and parent == .file_ref) {
+                    if (attrStr(attrs, "Value")) |v| {
+                        if (v.len > 0) {
+                            var tmp: std.ArrayList(u8) = .empty;
+                            try appendUnescaped(s.a, &tmp, v);
+                            s.mx_patch_name = tmp.items;
+                        }
+                    }
+                } else if (s.in_mx_file_ref and parent == .file_ref) {
+                    if (attrStr(attrs, "Value")) |v| {
+                        if (v.len > 0) {
+                            var tmp: std.ArrayList(u8) = .empty;
+                            try appendUnescaped(s.a, &tmp, v);
+                            s.mx_name = tmp.items;
+                        }
+                    }
+                } else if (s.in_mx_drop_item and parent == .mx_d_full_file_drop) {
+                    if (attrStr(attrs, "Value")) |v| {
+                        if (v.len > 0) {
+                            var tmp: std.ArrayList(u8) = .empty;
+                            try appendUnescaped(s.a, &tmp, v);
+                            s.cur_drop_name = tmp.items;
+                        }
+                    }
+                } else if (s.in_mx_param and (parent == .mx_d_float_param or parent == .mx_d_int_param or parent == .mx_d_enum_param)) {
+                    if (attrStr(attrs, "Value")) |v| {
+                        if (v.len > 0) {
+                            var tmp: std.ArrayList(u8) = .empty;
+                            try appendUnescaped(s.a, &tmp, v);
+                            s.cur_mx_param.name = tmp.items;
+                        }
+                    }
                 } else if (s.in_midi_clip and parent == .midi_clip) {
                     if (attrStr(attrs, "Value")) |v| {
                         var tmp: std.ArrayList(u8) = .empty;
@@ -1287,9 +1978,9 @@ const ParserState = struct {
                             if (std.fmt.parseInt(i32, v[slash + 1 ..], 10)) |ch| {
                                 ch_val = ch;
                                 if (ch == 2 or ch == 7) {
-                                    s.track_light_mode = .pulse; // Ch. 3 (Programmer) / Ch. 8 (User 1)
+                                    s.track_light_mode = .pulse;
                                 } else if (ch == 1 or ch == 6) {
-                                    s.track_light_mode = .flash; // Ch. 2 (Programmer) / Ch. 7 (User 1)
+                                    s.track_light_mode = .flash;
                                 }
                             } else |_| {}
                         }
@@ -1301,6 +1992,17 @@ const ParserState = struct {
             },
 
             .min, .max => {
+                if (parent == .midi_controller_range) {
+                    if (attrFloat(attrs, "Value")) |fv| {
+                        if (tag == .min) {
+                            s.cur_mcr_min = fv;
+                            s.cur_mcr_has_min = true;
+                        } else {
+                            s.cur_mcr_max = fv;
+                            s.cur_mcr_has_max = true;
+                        }
+                    }
+                }
                 if (attrInt(attrs, "Value")) |iv| {
                     const v: u8 = @intCast(std.math.clamp(iv, 0, 127));
                     if (parent == .branch_selector_range) {
@@ -1322,12 +2024,49 @@ const ParserState = struct {
                             const f = &s.inst_stack[s.inst_depth - 1];
                             if (tag == .min) f.key_min = v else f.key_max = v;
                         }
+                    } else if (parent == .velocity_range and !s.in_simpler and s.branch_depth > 0) {
+                        const b = &s.out.midi_branches.items[s.branch_stack[s.branch_depth - 1]];
+                        if (tag == .min) b.vel_min = v else b.vel_max = v;
+                    } else if (tag == .min and parent == .midi_controller_range and grand == .chain_selector and v >= 1 and v <= 15) {
+                        if (s.rack_depth == 1 and s.branch_depth == 0) {
+                            s.out.midi_racks.items[s.rack_stack[0]].sel_offset = v;
+                        } else if (s.inst_group_depth == 1 and s.inst_depth == 0 and !s.in_drum_group) {
+                            s.outer_inst_sel_offset = v;
+                        }
                     }
                 }
             },
 
             .manual => {
                 s.handleManual(parent, grand, attrs);
+                s.manual_depth = s.depth;
+            },
+            .float_event, .bool_event, .enum_event => {
+                // Track-level AutomationEnvelopes -> record candidate page-switch events (resolved after DeviceChain)
+                if (tag == .float_event and s.in_auto_envelope and s.cur_env_in_events and s.out.raw_auto_events.items.len < 65536) {
+                    if (s.cur_env_target_id) |tid| {
+                        const beat = attrFloat(attrs, "Time") orelse -1.0;
+                        const val = attrFloat(attrs, "Value") orelse -1.0;
+                        if (beat >= 0.0 and std.math.isFinite(val) and val >= 0.0 and val <= 127.0) {
+                            try s.out.raw_auto_events.append(s.a, .{
+                                .pointee_id = tid,
+                                .beat = beat,
+                                .val = val,
+                            });
+                        }
+                    }
+                }
+                // Ableton Live 8 stores initial parameter values in ArrangerAutomation/Events at Time="-63072000".
+                if (parent == .events and grand == .arranger_automation and s.depth >= 4) {
+                    const param_depth = s.depth - 2;
+                    if (s.manual_depth != param_depth) {
+                        if (attrStr(attrs, "Time")) |ts| {
+                            if (std.mem.startsWith(u8, ts, "-63072000")) {
+                                s.handleManual(s.stack[s.depth - 3], s.stack[s.depth - 4], attrs);
+                            }
+                        }
+                    }
+                }
             },
             else => {},
         }
@@ -1345,45 +2084,170 @@ const ParserState = struct {
     fn onClose(s: *ParserState, name: []const u8) void {
         const tag = tag_map.get(name) orelse .other;
         if (s.depth > 0) s.depth -= 1;
+        if (s.depth < s.manual_depth) s.manual_depth = 0;
+        if (s.depth < s.cur_keymidi_depth) {
+            s.cur_keymidi_macro = null;
+            s.cur_keymidi_depth = 0;
+        }
+        if (s.depth < s.macro_mapped_depth) {
+            s.macro_mapped_depth = 0;
+        }
         s.finishTag(tag);
+    }
+
+    fn applyMacroMappedValue(s: *ParserState, param_tag: Tag, val: f64) void {
+        if (!std.math.isFinite(val)) return;
+        if (tagToMacroIndex(param_tag)) |mi| {
+            if (s.rack_depth > 0) {
+                s.rack_macros[s.rack_depth - 1][mi] = @floatCast(std.math.clamp(val, 0.0, 127.0));
+                s.rack_has_macro[s.rack_depth - 1][mi] = true;
+            }
+            return;
+        }
+        const bidx = s.active_dev_branch orelse return;
+        const dev = &s.out.midi_branches.items[bidx].devs.items[s.active_dev_idx];
+        switch (dev.*) {
+            .velocity => |*ve| switch (param_tag) {
+                .min_out => ve.min_out = @intCast(std.math.clamp(@as(i32, @intFromFloat(@round(val))), 0, 127)),
+                .max_out => ve.max_out = @intCast(std.math.clamp(@as(i32, @intFromFloat(@round(val))), 0, 127)),
+                else => {},
+            },
+            .arp => |*ar| switch (param_tag) {
+                .synced_rate => ar.synced_rate = @intCast(std.math.clamp(@as(i32, @intFromFloat(@round(val))), 0, 15)),
+                else => {},
+            },
+            .note_length => |*nl| switch (param_tag) {
+                .synced_length => nl.synced_len = @intCast(std.math.clamp(@as(i32, @intFromFloat(@round(val))), 0, 15)),
+                else => {},
+            },
+            else => {},
+        }
     }
 
     fn finishTag(s: *ParserState, tag: Tag) void {
         switch (tag) {
             .master_track => s.in_master = false,
             .return_track => s.in_return_track = false,
+            .main_sequencer => s.in_main_sequencer = false,
+            .automation_envelopes => {
+                s.in_auto_envelopes = false;
+                s.in_auto_envelope = false;
+                s.cur_env_in_events = false;
+            },
+            .automation_envelope => {
+                s.in_auto_envelope = false;
+                s.cur_env_target_id = null;
+                s.cur_env_in_events = false;
+            },
+            .events => s.cur_env_in_events = false,
+            .key_midi => {
+                if (s.cur_keymidi_ch == 16) {
+                    if (s.cur_keymidi_nc) |nc| s.cur_keymidi_macro = nc;
+                }
+            },
+            .midi_controller_range => {
+                // Apply AbletonMacroMapping when parameter has KeyMidi Channel=16 + MidiControllerRange
+                if (s.cur_keymidi_macro) |mi| {
+                    if (s.cur_mcr_has_min and s.cur_mcr_has_max and s.rack_depth > 0) {
+                        const param_tag = s.parentTag();
+                        const owner_rack_idx: ?usize = if (tagToMacroIndex(param_tag) != null)
+                            (if (s.rack_depth >= 2) s.rack_depth - 2 else null)
+                        else
+                            s.rack_depth - 1;
+                        if (owner_rack_idx) |ri| {
+                            if (s.rack_has_macro[ri][mi]) {
+                                const mval: f64 = s.rack_macros[ri][mi];
+                                const mapped = s.cur_mcr_min + (mval / 127.0) * (s.cur_mcr_max - s.cur_mcr_min);
+                                s.applyMacroMappedValue(param_tag, mapped);
+                                s.macro_mapped_depth = s.depth;
+                            }
+                        }
+                    }
+                }
+            },
             .midi_track => {
                 if (s.in_midi_track and !s.in_return_track) {
                     if (s.track_has_drum) {
-                        // Keep Arrangement MidiClips from the sample track for AutoPlay
-                        s.out.arr_clips.appendSlice(s.a, s.track_clips.items) catch {};
+                        if (s.track_muted) {
+                            s.out.pad_samples.items.len = s.track_sample_start;
+                            s.out.mx_instruments.items.len = s.track_mxi_start;
+                            s.out.audio_wormholes.items.len = s.track_wh_start;
+                        } else {
+                            s.out.drum_tracks_seen += 1;
+                            if (s.out.drum_tracks_seen > 1) {
+                                // Dual-Launchpad guard: keep primary 8x8 drum track so right-pad samples don't overwrite left-pad ones.
+                                s.out.pad_samples.items.len = s.track_sample_start;
+                                s.out.mx_instruments.items.len = s.track_mxi_start;
+                                s.out.audio_wormholes.items.len = s.track_wh_start;
+                            } else {
+                                s.out.arr_clips.appendSlice(s.a, s.track_clips.items) catch {};
+                            }
+                        }
                     } else {
-                        // Light tracks have MIDI effect racks without DrumGroupDevice
-                        for (s.track_root_racks.items) |ridx| {
-                            s.out.light_root_racks.append(s.a, .{
-                                .rack_idx = ridx,
-                                .mode = s.track_light_mode,
-                                .legacy_rg = s.track_legacy_rg,
-                            }) catch {};
+                        if (s.track_clips.items.len > 0) {
+                            s.out.fallback_clips.appendSlice(s.a, s.track_clips.items) catch {};
+                        }
+                        const receives_live = !s.track_muted and (!s.track_has_monitoring or s.track_monitoring == 0 or (s.track_monitoring == 1 and s.track_armed));
+                        if (receives_live) {
+                            for (s.track_root_racks.items) |ridx| {
+                                s.out.light_root_racks.append(s.a, .{
+                                    .rack_idx = ridx,
+                                    .mode = s.track_light_mode,
+                                    .legacy_rg = s.track_legacy_rg,
+                                }) catch {};
+                            }
                         }
                     }
                 }
                 s.in_midi_track = false;
                 s.track_has_drum = false;
             },
+            .instrument_group_device => {
+                if (s.inst_group_depth > 0) {
+                    s.inst_group_depth -= 1;
+                    if (s.inst_group_depth == 0 and s.outer_inst_sel_offset > 0) {
+                        const off = s.outer_inst_sel_offset;
+                        var all_ge = true;
+                        for (s.out.pad_samples.items[s.outer_inst_sample_start..]) |pm| {
+                            if (pm.sel_min < off) {
+                                all_ge = false;
+                                break;
+                            }
+                        }
+                        if (all_ge) {
+                            for (s.out.pad_samples.items[s.outer_inst_sample_start..]) |*pm| {
+                                pm.sel_min -= off;
+                                pm.sel_max -= off;
+                            }
+                        }
+                        s.outer_inst_sel_offset = 0;
+                    }
+                }
+            },
             .drum_group_device => s.in_drum_group = false,
             .drum_branch => {
                 if (s.in_drum_branch) {
                     if (s.has_drum_note and !s.drum_branch_muted) {
-                        for (s.out.pad_samples.items[s.drum_branch_sample_start..]) |*pm| {
-                            pm.midi_note = s.cur_drum_note;
+                        const ps = s.out.pad_samples.items[s.drum_branch_sample_start..];
+                        for (ps) |*pm| pm.midi_note = s.cur_drum_note;
+                        if (s.drum_branch_reverse_multi and ps.len > 1) {
+                            std.mem.reverse(PadMapping, ps);
+                        }
+                        for (s.out.audio_wormholes.items[s.drum_branch_wh_start..]) |*aw| {
+                            aw.midi_note = s.cur_drum_note;
+                        }
+                        for (s.out.mx_instruments.items[s.drum_branch_mxi_start..]) |*mxi| {
+                            mxi.drum_note = s.cur_drum_note;
                         }
                     } else {
                         s.out.pad_samples.items.len = s.drum_branch_sample_start;
+                        s.out.audio_wormholes.items.len = s.drum_branch_wh_start;
+                        s.out.mx_instruments.items.len = s.drum_branch_mxi_start;
                     }
                 }
                 s.in_drum_branch = false;
                 s.drum_branch_muted = false;
+                s.drum_branch_reverse_multi = false;
                 s.has_drum_note = false;
             },
             .instrument_branch => {
@@ -1392,9 +2256,10 @@ const ParserState = struct {
                     const frame = s.inst_stack[s.inst_depth];
                     if (frame.muted) {
                         s.out.pad_samples.items.len = frame.sample_start;
+                        s.out.audio_wormholes.items.len = frame.wh_start;
+                        s.out.mx_instruments.items.len = frame.mxi_start;
                     } else {
                         for (s.out.pad_samples.items[frame.sample_start..]) |*pm| {
-                            // Outermost InstrumentBranch owns page/chain selector; all nesting levels intersect KeyRange.
                             if (s.inst_depth == 0) {
                                 pm.sel_min = frame.sel_min;
                                 pm.sel_max = frame.sel_max;
@@ -1402,10 +2267,65 @@ const ParserState = struct {
                             pm.key_min = @max(pm.key_min, frame.key_min);
                             pm.key_max = @min(pm.key_max, frame.key_max);
                         }
+                        if (s.inst_depth == 0) {
+                            for (s.out.audio_wormholes.items[frame.wh_start..]) |*aw| {
+                                aw.sel_min = frame.sel_min;
+                                aw.sel_max = frame.sel_max;
+                            }
+                            for (s.out.mx_instruments.items[frame.mxi_start..]) |*mxi| {
+                                mxi.sel_min = frame.sel_min;
+                                mxi.sel_max = frame.sel_max;
+                            }
+                        }
                     }
                 }
             },
-            .file_ref => s.in_sample_file_ref = false,
+            .file_ref => {
+                if (s.in_mx_patch_ref) {
+                    s.in_mx_patch_ref = false;
+                } else if (s.in_mx_file_ref) {
+                    if (s.mx_name.len > 0 or s.mx_rel.items.len > 0) {
+                        const rel_copy = s.a.dupe(u8, s.mx_rel.items) catch "";
+                        s.mx_drops.append(s.a, .{
+                            .name = s.cur_drop_name,
+                            .rel_path = rel_copy,
+                            .file_name = s.mx_name,
+                        }) catch {};
+                    }
+                    s.in_mx_file_ref = false;
+                }
+                s.in_sample_file_ref = false;
+            },
+            .patch_slot => {
+                s.in_mx_patch_slot = false;
+                s.in_mx_patch_ref = false;
+            },
+            .blob => s.in_mx_blob = false,
+            .blob_slot => {
+                s.in_mx_blob_slot = false;
+                s.in_mx_blob = false;
+            },
+            .mx_d_float_param, .mx_d_int_param, .mx_d_enum_param => {
+                if (s.in_mx and s.in_mx_param) {
+                    s.mx_params.append(s.a, s.cur_mx_param) catch {};
+                    s.in_mx_param = false;
+                }
+            },
+            .parameter_list => {
+                if (s.in_mx and s.parentTag() == .mx_device_midi_effect or s.parentTag() == .mx_device_instrument) {
+                    s.in_mx_param_list = false;
+                }
+            },
+            .mx_d_full_file_drop => {
+                s.in_mx_drop_item = false;
+                s.cur_drop_name = "";
+            },
+            .file_drop_list => {
+                if (s.in_mx and (s.parentTag() == .mx_device_midi_effect or s.parentTag() == .mx_device_instrument)) {
+                    s.in_mx_file_drop = false;
+                    s.in_mx_file_ref = false;
+                }
+            },
             .sample_ref => {
                 s.in_sample_ref = false;
                 s.in_sample_file_ref = false;
@@ -1426,6 +2346,10 @@ const ParserState = struct {
                         .sample_end = s.simpler_end,
                         .default_duration = s.simpler_default_dur,
                         .default_sample_rate = s.simpler_default_sr,
+                        .transpose_semitones = s.simpler_transpose,
+                        .fade_in_ms = s.simpler_fade_in_ms,
+                        .fade_out_ms = s.simpler_fade_out_ms,
+                        .volume_db = s.simpler_volume_db,
                     }) catch {};
                 }
                 s.in_simpler = false;
@@ -1437,7 +2361,55 @@ const ParserState = struct {
             .midi_effect_branch => {
                 if (s.branch_depth > 0) s.branch_depth -= 1;
             },
-            .midi_pitcher, .midi_chord, .midi_velocity, .midi_note_length, .midi_arpeggiator, .midi_random, .mx_device_midi_effect => {
+            .midi_random => {
+                if (s.in_audio_random) {
+                    if (s.audio_rnd_on and s.audio_rnd_alt and s.audio_rnd_chance >= 0.5 and s.audio_rnd_sign == 1) {
+                        s.drum_branch_reverse_multi = true;
+                    }
+                    s.in_audio_random = false;
+                }
+                if (s.active_dev_tag == tag) {
+                    s.active_dev_branch = null;
+                    s.active_dev_tag = .other;
+                }
+            },
+            .mx_device_midi_effect => {
+                if (s.in_mx and !s.mx_is_instrument) {
+                    const data = s.finishMxData();
+                    if (s.mx_in_audio_drum) {
+                        const sel_min: u8 = if (s.inst_depth > 0) s.inst_stack[0].sel_min else 0;
+                        const sel_max: u8 = if (s.inst_depth > 0) s.inst_stack[0].sel_max else 0;
+                        s.out.audio_wormholes.append(s.a, .{
+                            .sel_min = sel_min,
+                            .sel_max = sel_max,
+                            .midi_note = s.cur_drum_note,
+                            .data = data,
+                        }) catch {};
+                    } else if (s.active_dev_branch) |bidx| {
+                        s.out.midi_branches.items[bidx].devs.items[s.active_dev_idx].mx_ext = data;
+                    }
+                    s.in_mx = false;
+                }
+                if (s.active_dev_tag == tag) {
+                    s.active_dev_branch = null;
+                    s.active_dev_tag = .other;
+                }
+            },
+            .mx_device_instrument => {
+                if (s.in_mx and s.mx_is_instrument) {
+                    const data = s.finishMxData();
+                    const sel_min: u8 = if (s.inst_depth > 0) s.inst_stack[0].sel_min else 0;
+                    const sel_max: u8 = if (s.inst_depth > 0) s.inst_stack[0].sel_max else 0;
+                    s.out.mx_instruments.append(s.a, .{
+                        .sel_min = sel_min,
+                        .sel_max = sel_max,
+                        .drum_note = if (s.in_drum_branch) s.cur_drum_note else null,
+                        .data = data,
+                    }) catch {};
+                    s.in_mx = false;
+                }
+            },
+            .midi_pitcher, .midi_chord, .midi_velocity, .midi_note_length, .midi_arpeggiator => {
                 if (s.active_dev_tag == tag) {
                     s.active_dev_branch = null;
                     s.active_dev_tag = .other;
@@ -1478,9 +2450,81 @@ const ParserState = struct {
     }
 
     fn handleManual(s: *ParserState, parent: Tag, grand: Tag, attrs: []const u8) void {
+        if (s.macro_mapped_depth != 0 and s.depth == s.macro_mapped_depth) return;
         if (parent == .tempo and s.in_master) {
             if (attrFloat(attrs, "Value")) |v| {
                 if (v >= 20.0 and v <= 400.0) s.out.tempo = v;
+            }
+            return;
+        }
+        // Max parameter value (<ParameterList><MxDFloatParameter|Int|Enum><Timeable><Manual Value="..."/>)
+        if (s.in_mx and s.in_mx_param and parent == .timeable) {
+            if (attrFloat(attrs, "Value")) |v| {
+                if (std.math.isFinite(v)) s.cur_mx_param.value = v;
+            }
+            return;
+        }
+        // OriginalSimpler TransposeKey, Volume, FadeInTime, FadeOutTime
+        if (s.in_simpler) {
+            if (parent == .transpose_key) {
+                if (attrInt(attrs, "Value")) |v| {
+                    s.simpler_transpose = @intCast(std.math.clamp(v, -48, 48));
+                }
+                return;
+            }
+            if (parent == .volume and grand == .volume_and_pan) {
+                if (attrFloat(attrs, "Value")) |v| {
+                    if (std.math.isFinite(v)) s.simpler_volume_db = @floatCast(std.math.clamp(v, -60.0, 24.0));
+                }
+                return;
+            }
+            if (parent == .fade_in_time and grand == .one_shot_envelope) {
+                if (attrFloat(attrs, "Value")) |v| {
+                    if (std.math.isFinite(v)) s.simpler_fade_in_ms = @floatCast(std.math.clamp(v, 0.0, 30000.0));
+                }
+                return;
+            }
+            if (parent == .fade_out_time and grand == .one_shot_envelope) {
+                if (attrFloat(attrs, "Value")) |v| {
+                    if (std.math.isFinite(v)) s.simpler_fade_out_ms = @floatCast(std.math.clamp(v, 0.0, 30000.0));
+                }
+                return;
+            }
+        }
+        // Audio-track MidiRandom inside DrumBranch
+        if (s.in_audio_random) {
+            switch (parent) {
+                .on => if (attrStr(attrs, "Value")) |v| {
+                    s.audio_rnd_on = !std.mem.eql(u8, v, "false");
+                },
+                .chance => if (attrFloat(attrs, "Value")) |v| {
+                    s.audio_rnd_chance = @floatCast(std.math.clamp(v, 0.0, 1.0));
+                },
+                .sign => if (attrInt(attrs, "Value")) |v| {
+                    s.audio_rnd_sign = @intCast(std.math.clamp(v, 0, 2));
+                },
+                .alternate => if (attrStr(attrs, "Value")) |v| {
+                    s.audio_rnd_alt = std.mem.eql(u8, v, "true");
+                },
+                else => {},
+            }
+            return;
+        }
+        // Rack MacroControls.0..15 values
+        if (tagToMacroIndex(parent)) |mi| {
+            if (grand == .midi_effect_group_device and s.rack_depth > 0) {
+                if (attrFloat(attrs, "Value")) |v| {
+                    if (std.math.isFinite(v)) {
+                        s.rack_macros[s.rack_depth - 1][mi] = @floatCast(std.math.clamp(v, 0.0, 127.0));
+                        s.rack_has_macro[s.rack_depth - 1][mi] = true;
+                    }
+                }
+            }
+            return;
+        }
+        if (parent == .speaker and grand == .mixer and s.in_midi_track and !s.in_return_track and s.branch_depth == 0 and s.inst_depth == 0 and !s.in_drum_branch) {
+            if (attrStr(attrs, "Value")) |v| {
+                s.track_muted = std.mem.eql(u8, v, "false");
             }
             return;
         }
@@ -1499,6 +2543,10 @@ const ParserState = struct {
         }
         if (parent == .on) {
             const on_val = if (attrStr(attrs, "Value")) |v| !std.mem.eql(u8, v, "false") else true;
+            if (s.in_mx and (grand == .mx_device_midi_effect or grand == .mx_device_instrument)) {
+                s.mx_on = on_val;
+                return;
+            }
             if (s.in_simpler and (grand == .original_simpler or grand == .multi_sampler)) {
                 s.simpler_on = on_val;
                 return;
@@ -1615,6 +2663,15 @@ const ParserState = struct {
                 .transpose_distance => if (attrInt(attrs, "Value")) |v| {
                     ar.transpose_dist = @intCast(std.math.clamp(v, -48, 48));
                 },
+                .velocity_switch => if (attrStr(attrs, "Value")) |v| {
+                    ar.vel_switch = std.mem.eql(u8, v, "true");
+                },
+                .velocity_target => if (attrInt(attrs, "Value")) |v| {
+                    ar.vel_target = @intCast(std.math.clamp(v, 0, 127));
+                },
+                .velocity_decay => if (attrFloat(attrs, "Value")) |v| {
+                    ar.vel_decay_ms = @floatCast(std.math.clamp(v, 1.0, 60000.0));
+                },
                 else => {},
             },
             .random => |*rnd| switch (parent) {
@@ -1671,11 +2728,14 @@ fn feedXmlChunk(a: std.mem.Allocator, st: *ParserState, carry: *std.ArrayList(u8
     var pos: usize = 0;
     while (pos < data.len) {
         const lt = std.mem.indexOfScalarPos(u8, data, pos, '<') orelse {
+            if (st.in_mx_blob) try st.onBlobText(data[pos..]);
             pos = data.len;
             break;
         };
+        if (st.in_mx_blob and lt > pos) {
+            try st.onBlobText(data[pos..lt]);
+        }
         const gt = std.mem.indexOfScalarPos(u8, data, lt + 1, '>') orelse {
-            // Incomplete tag split across chunks: keep from `lt` in carry.
             const tail = data[lt..];
             if (carry.items.len > 0) {
                 std.mem.copyForwards(u8, carry.items[0..tail.len], tail);
@@ -1780,13 +2840,6 @@ fn appendUnescaped(a: std.mem.Allocator, dst: *std.ArrayList(u8), s: []const u8)
 // MIDI Effect Rack Lightshow Simulator
 // ============================================================================
 
-const SimNote = struct {
-    start_ms: f64,
-    dur_ms: f64,
-    note: u8,
-    vel: u8,
-};
-
 const LedTransKind = enum(u8) { off = 0, on = 1, update = 2 };
 
 const LedTrans = struct {
@@ -1796,6 +2849,7 @@ const LedTrans = struct {
     slot: u8,
     vel: u8,
     color: u32,
+    layer: i16 = 0,
 };
 
 fn scaleArgb(argb: u32, factor: f64) u32 {
@@ -1806,7 +2860,7 @@ fn scaleArgb(argb: u32, factor: f64) u32 {
     return a_ch | (r << 16) | (g << 8) | b;
 }
 
-const max_sim_notes = 32768;
+const max_sim_notes = m4l.max_sim_notes;
 const max_sim_depth = 12;
 
 const MidiExtEntry = struct {
@@ -1820,9 +2874,15 @@ const MidiExtCtx = struct {
     mid_path_index: std.StringHashMapUnmanaged(VirtualFile) = .empty,
     mid_base_index: std.StringHashMapUnmanaged(VirtualFile) = .empty,
     cache: std.AutoHashMapUnmanaged(u32, []const SimNote) = .empty,
+    mask_channels: std.AutoHashMapUnmanaged(u8, []const SimNote) = .empty,
 };
 
-fn buildMidiExtCtx(a: std.mem.Allocator, files: []const VirtualFile) !MidiExtCtx {
+fn buildMidiExtCtx(
+    a: std.mem.Allocator,
+    files: []const VirtualFile,
+    parsed: *const ParsedAls,
+    hash_cache: *m4l.AmxdHashCache,
+) !MidiExtCtx {
     var ctx: MidiExtCtx = .{};
     for (files) |f| {
         if (endsWithIgnoreCase(f.rel_path, ".mid") or endsWithIgnoreCase(f.rel_path, ".midi")) {
@@ -1833,6 +2893,26 @@ fn buildMidiExtCtx(a: std.mem.Allocator, files: []const VirtualFile) !MidiExtCtx
         }
         if (std.ascii.eqlIgnoreCase(basenameOf(f.rel_path), "0save")) {
             try parseZeroSave(a, f.bytes, &ctx);
+        }
+    }
+
+    // Amethyst MidiExtensionMaskRouter: scan branches for (DepthsMixer -> MIDIext in Mask mode) pairs
+    for (parsed.midi_branches.items) |b| {
+        if (b.devs.items.len < 2) continue;
+        for (0..b.devs.items.len - 1) |i| {
+            if (b.devs.items[i] != .mx_ext or b.devs.items[i + 1] != .mx_ext) continue;
+            const d0 = b.devs.items[i].mx_ext;
+            const d1 = b.devs.items[i + 1].mx_ext;
+            const id0 = m4l.identifyMxDevice(a, hash_cache, files, d0);
+            const id1 = m4l.identifyMxDevice(a, hash_cache, files, d1);
+            if (id0.kind != .depths_mixer) continue;
+            if (id1.kind != .midi_ext and id1.kind != .midi_fire) continue;
+            const settings = m4l.parseGenericMidiExtSettings(d1);
+            if (!settings.is_mask) continue;
+            const ch = m4l.parseDepthsMixerChannel(d0) orelse continue;
+            if (try resolveMidiExtNotes(a, &ctx, d1, parsed.tempo)) |seq| {
+                try ctx.mask_channels.put(a, ch, seq);
+            }
         }
     }
     return ctx;
@@ -1880,43 +2960,60 @@ fn parseZeroSave(a: std.mem.Allocator, bytes: []const u8, ctx: *MidiExtCtx) !voi
     }
 }
 
-fn resolveMidiExtNotes(a: std.mem.Allocator, ctx: *MidiExtCtx, lom_id: u32) std.mem.Allocator.Error!?[]const SimNote {
-    if (lom_id == 0) return null;
-    if (ctx.cache.get(lom_id)) |cached| return cached;
-    const entry = ctx.entries.get(lom_id) orelse return null;
-    if (entry.file_path.len == 0) return null;
-
+fn lookupMidiVirtualFile(a: std.mem.Allocator, ctx: *const MidiExtCtx, raw_path: []const u8, file_name: []const u8) std.mem.Allocator.Error!?VirtualFile {
     var norm: std.ArrayList(u8) = .empty;
     defer norm.deinit(a);
-    for (entry.file_path) |ch| {
-        try norm.append(a, if (ch == '\\') '/' else std.ascii.toLower(ch));
-    }
-    var trimmed: []const u8 = norm.items;
-    while (std.mem.startsWith(u8, trimmed, "./") or std.mem.startsWith(u8, trimmed, "/")) {
-        trimmed = trimmed[if (trimmed[0] == '.') 2 else 1 ..];
-    }
+    if (raw_path.len > 0) {
+        for (raw_path) |ch| try norm.append(a, if (ch == '\\') '/' else std.ascii.toLower(ch));
+        if (file_name.len > 0 and !endsWithIgnoreCase(raw_path, file_name)) {
+            if (norm.items[norm.items.len - 1] != '/') try norm.append(a, '/');
+            for (file_name) |ch| try norm.append(a, std.ascii.toLower(ch));
+        }
+    } else if (file_name.len > 0) {
+        for (file_name) |ch| try norm.append(a, std.ascii.toLower(ch));
+    } else return null;
 
-    var vf: ?VirtualFile = ctx.mid_path_index.get(trimmed);
-    if (vf == null) {
-        var it = ctx.mid_path_index.iterator();
-        while (it.next()) |kv| {
-            if (std.mem.endsWith(u8, kv.key_ptr.*, trimmed)) {
-                vf = kv.value_ptr.*;
-                break;
+    var trimmed: []const u8 = norm.items;
+    while (std.mem.startsWith(u8, trimmed, "../")) trimmed = trimmed[3..];
+    while (std.mem.startsWith(u8, trimmed, "./")) trimmed = trimmed[2..];
+    while (std.mem.startsWith(u8, trimmed, "/")) trimmed = trimmed[1..];
+
+    if (ctx.mid_path_index.get(trimmed)) |vf| return vf;
+    var it = ctx.mid_path_index.iterator();
+    while (it.next()) |kv| {
+        if (std.mem.endsWith(u8, kv.key_ptr.*, trimmed)) return kv.value_ptr.*;
+    }
+    return ctx.mid_base_index.get(basenameOf(trimmed));
+}
+
+fn resolveMidiExtNotes(
+    a: std.mem.Allocator,
+    ctx: *MidiExtCtx,
+    mx: @FieldType(MidiDev, "mx_ext"),
+    proj_tempo: f64,
+) std.mem.Allocator.Error!?[]const SimNote {
+    // 1. Classic 0save + LomId lookup
+    if (mx.lom_id != 0) {
+        if (ctx.cache.get(mx.lom_id)) |cached| return cached;
+        if (ctx.entries.get(mx.lom_id)) |entry| {
+            if (entry.file_path.len > 0) {
+                const vf = try lookupMidiVirtualFile(a, ctx, entry.file_path, "");
+                const notes: []const SimNote = if (vf) |f|
+                    try parseSmfNotes(a, f.bytes, entry.temp1, entry.temp2)
+                else
+                    &.{};
+                try ctx.cache.put(a, mx.lom_id, notes);
+                return notes;
             }
         }
     }
-    if (vf == null) {
-        const base = basenameOf(trimmed);
-        vf = ctx.mid_base_index.get(base);
-    }
 
-    const notes: []const SimNote = if (vf) |f|
-        try parseSmfNotes(a, f.bytes, entry.temp1, entry.temp2)
-    else
-        &.{};
-    try ctx.cache.put(a, lom_id, notes);
-    return notes;
+    // 2. Modern Kaskobi MIDI Extension / MIDI Launcher / MIDI Fire direct FileDropList .mid reference
+    if (mx.mid_name.len > 0 or mx.mid_rel.len > 0) {
+        const vf = try lookupMidiVirtualFile(a, ctx, mx.mid_rel, mx.mid_name) orelse return null;
+        return try parseSmfNotes(a, vf.bytes, proj_tempo, proj_tempo);
+    }
+    return null;
 }
 
 fn readVlq(data: []const u8, pos: *usize, end: usize) ?u32 {
@@ -2104,31 +3201,58 @@ fn lcmUsize(x: usize, y: usize) usize {
     return (x / std.math.gcd(x, y)) * y;
 }
 
+fn resolveDropMidiNotes(
+    a: std.mem.Allocator,
+    ctx: *const MidiExtCtx,
+    drop: m4l.MxFileDrop,
+    tempo: f64,
+    skip_silence: bool,
+) std.mem.Allocator.Error!?[]const SimNote {
+    const vf = try lookupMidiVirtualFile(a, ctx, drop.rel_path, drop.file_name) orelse return null;
+    const raw = try parseSmfNotes(a, vf.bytes, tempo, tempo);
+    if (!skip_silence or raw.len == 0) return raw;
+    var min_t: f64 = raw[0].start_ms;
+    for (raw[1..]) |n| if (n.start_ms < min_t) {
+        min_t = n.start_ms;
+    };
+    if (min_t <= 0.5) return raw;
+    const shifted = try a.alloc(SimNote, raw.len);
+    for (raw, 0..) |n, i| {
+        shifted[i] = n;
+        shifted[i].start_ms = @max(0.0, n.start_ms - min_t);
+    }
+    return shifted;
+}
+
 fn simulatePadLights(
     a: std.mem.Allocator,
     parsed: *const ParsedAls,
     midiext: *MidiExtCtx,
+    hash_cache: *m4l.AmxdHashCache,
+    files: []const VirtualFile,
+    custom_palette: ?[128]u32,
     layout: NoteLayout,
     beat_ms: f64,
     chain: u8,
     trig_note: u8,
-) ![]const []const LedEvent {
+    wormhole_out: *?u8,
+) ![]const LedCellAnim {
     var cycle_len: usize = 1;
-    const evs0 = try simulatePadLightsPress(a, parsed, midiext, layout, beat_ms, chain, trig_note, 0, &cycle_len);
+    const anim0 = try simulatePadLightsPress(a, parsed, midiext, hash_cache, files, custom_palette, layout, beat_ms, chain, trig_note, 0, &cycle_len, wormhole_out);
     if (cycle_len <= 1) {
-        if (evs0.len == 0) return &.{};
-        const single = try a.alloc([]const LedEvent, 1);
-        single[0] = evs0;
+        if (anim0.events.len == 0) return &.{};
+        const single = try a.alloc(LedCellAnim, 1);
+        single[0] = anim0;
         return single;
     }
 
-    const anims = try a.alloc([]const LedEvent, cycle_len);
-    anims[0] = evs0;
-    var any_non_empty = evs0.len > 0;
+    const anims = try a.alloc(LedCellAnim, cycle_len);
+    anims[0] = anim0;
+    var any_non_empty = anim0.events.len > 0;
     for (1..cycle_len) |p| {
         var dummy: usize = cycle_len;
-        anims[p] = try simulatePadLightsPress(a, parsed, midiext, layout, beat_ms, chain, trig_note, p, &dummy);
-        if (anims[p].len > 0) any_non_empty = true;
+        anims[p] = try simulatePadLightsPress(a, parsed, midiext, hash_cache, files, custom_palette, layout, beat_ms, chain, trig_note, p, &dummy, wormhole_out);
+        if (anims[p].events.len > 0) any_non_empty = true;
     }
     if (!any_non_empty) return &.{};
     return anims;
@@ -2138,13 +3262,17 @@ fn simulatePadLightsPress(
     a: std.mem.Allocator,
     parsed: *const ParsedAls,
     midiext: *MidiExtCtx,
+    hash_cache: *m4l.AmxdHashCache,
+    files: []const VirtualFile,
+    custom_palette: ?[128]u32,
     layout: NoteLayout,
     beat_ms: f64,
     chain: u8,
     trig_note: u8,
     press_idx: usize,
     cycle_len: *usize,
-) ![]const LedEvent {
+    wormhole_out: *?u8,
+) !LedCellAnim {
     var out_notes: std.ArrayList(SimNote) = .empty;
     defer out_notes.deinit(a);
 
@@ -2158,11 +3286,13 @@ fn simulatePadLightsPress(
         .vel = 127,
     }};
 
+    var any_loop = false;
     for (parsed.light_root_racks.items) |root_rack| {
         out_notes.clearRetainingCapacity();
-        try evalRack(a, parsed, midiext, root_rack.rack_idx, beat_ms, chain, &seed, &out_notes, 0, press_idx, cycle_len);
+        try evalRack(a, parsed, midiext, hash_cache, files, layout, root_rack.rack_idx, beat_ms, chain, &seed, &out_notes, 0, press_idx, cycle_len, wormhole_out, null);
         for (out_notes.items) |sn| {
             if (sn.vel == 0) continue;
+            if (sn.loop) any_loop = true;
             const vel: u8 = if (root_rack.legacy_rg) launchpadSToRgbVelocity(sn.vel) else sn.vel;
             if (vel == 0) continue;
             const slot: u8 = if (midiNoteToXY(layout, sn.note)) |xy|
@@ -2174,13 +3304,17 @@ fn simulatePadLightsPress(
             const t_on: u32 = @intFromFloat(std.math.clamp(@round(sn.start_ms), 0.0, 300000.0));
             const dur_clamped = std.math.clamp(sn.dur_ms, 5.0, 60000.0);
             const t_off: u32 = @intFromFloat(std.math.clamp(@round(sn.start_ms + dur_clamped), @as(f64, @floatFromInt(t_on + 1)), 360000.0));
-            const base_col = palette.argbOf(vel);
+            const base_col: u32 = if (sn.color_override != 0)
+                sn.color_override
+            else if (custom_palette) |cp|
+                cp[vel & 0x7F]
+            else
+                palette.argbOf(vel);
 
             if (root_rack.mode == .pulse and dur_clamped >= 300.0) {
-                // Launchpad hardware pulsing: smooth breathing cycle over 2 beats (20%..100% brightness).
                 const period_ms = @max(beat_ms * 2.0, 400.0);
                 const step_ms = @max(period_ms / 16.0, @max(65.0, dur_clamped / 240.0));
-                try trans.append(a, .{ .t_ms = t_on, .kind = .on, .slot = slot, .vel = vel, .color = base_col });
+                try trans.append(a, .{ .t_ms = t_on, .kind = .on, .slot = slot, .vel = vel, .color = base_col, .layer = sn.layer });
                 var dt: f64 = step_ms;
                 while (dt + 15.0 < dur_clamped) : (dt += step_ms) {
                     const phase = (dt / period_ms) * (2.0 * std.math.pi);
@@ -2189,10 +3323,10 @@ fn simulatePadLightsPress(
                     const v = palette.nearestVelocity(col);
                     const t_cur: u32 = @intFromFloat(@round(@as(f64, @floatFromInt(t_on)) + dt));
                     if (t_cur > t_on and t_cur < t_off) {
-                        try trans.append(a, .{ .t_ms = t_cur, .kind = .update, .slot = slot, .vel = v, .color = col });
+                        try trans.append(a, .{ .t_ms = t_cur, .kind = .update, .slot = slot, .vel = v, .color = col, .layer = sn.layer });
                     }
                 }
-                try trans.append(a, .{ .t_ms = t_off, .kind = .off, .slot = slot, .vel = 0, .color = 0 });
+                if (!sn.infinite) try trans.append(a, .{ .t_ms = t_off, .kind = .off, .slot = slot, .vel = 0, .color = 0, .layer = sn.layer });
             } else if (root_rack.mode == .flash and dur_clamped >= 200.0) {
                 const half = @max(beat_ms * 0.5, 100.0);
                 var dt: f64 = 0.0;
@@ -2200,23 +3334,23 @@ fn simulatePadLightsPress(
                     const s_t: u32 = @intFromFloat(@round(@as(f64, @floatFromInt(t_on)) + dt));
                     const e_t: u32 = @min(t_off, @as(u32, @intFromFloat(@round(@as(f64, @floatFromInt(t_on)) + dt + half))));
                     if (e_t > s_t) {
-                        try trans.append(a, .{ .t_ms = s_t, .kind = .on, .slot = slot, .vel = vel, .color = base_col });
-                        try trans.append(a, .{ .t_ms = e_t, .kind = .off, .slot = slot, .vel = 0, .color = 0 });
+                        try trans.append(a, .{ .t_ms = s_t, .kind = .on, .slot = slot, .vel = vel, .color = base_col, .layer = sn.layer });
+                        try trans.append(a, .{ .t_ms = e_t, .kind = .off, .slot = slot, .vel = 0, .color = 0, .layer = sn.layer });
                     }
                 }
             } else {
-                try trans.append(a, .{ .t_ms = t_on, .kind = .on, .slot = slot, .vel = vel, .color = base_col });
-                try trans.append(a, .{ .t_ms = t_off, .kind = .off, .slot = slot, .vel = 0, .color = 0 });
+                try trans.append(a, .{ .t_ms = t_on, .kind = .on, .slot = slot, .vel = vel, .color = base_col, .layer = sn.layer });
+                if (!sn.infinite) try trans.append(a, .{ .t_ms = t_off, .kind = .off, .slot = slot, .vel = 0, .color = 0, .layer = sn.layer });
             }
         }
     }
-    if (trans.items.len == 0) return &.{};
+    if (trans.items.len == 0) return .{ .events = &.{}, .loop = 1 };
 
     std.mem.sort(LedTrans, trans.items, {}, struct {
         fn lessThan(_: void, x: LedTrans, y: LedTrans) bool {
             if (x.t_ms != y.t_ms) return x.t_ms < y.t_ms;
-            // Process OFF before ON before UPDATE at identical timestamp so re-triggered pads/ring stay lit.
             if (x.kind != y.kind) return @intFromEnum(x.kind) < @intFromEnum(y.kind);
+            if (x.layer != y.layer) return x.layer < y.layer; // higher DepthsSelector layer drawn last (on top)
             return x.slot < y.slot;
         }
     }.lessThan);
@@ -2276,7 +3410,7 @@ fn simulatePadLightsPress(
             },
         }
     }
-    return events.items;
+    return .{ .events = events.items, .loop = if (any_loop) 0 else 1 };
 }
 
 fn branchChildRackMatchesNote(parsed: *const ParsedAls, b: *const MidiBranch, note: u8) bool {
@@ -2298,6 +3432,9 @@ fn evalRack(
     a: std.mem.Allocator,
     parsed: *const ParsedAls,
     midiext: *MidiExtCtx,
+    hash_cache: *m4l.AmxdHashCache,
+    files: []const VirtualFile,
+    layout: NoteLayout,
     ridx: u32,
     beat_ms: f64,
     chain: u8,
@@ -2306,14 +3443,27 @@ fn evalRack(
     depth: u8,
     press_idx: usize,
     cycle_len: *usize,
+    wormhole_out: *?u8,
+    multi_selector_override: ?u8,
 ) std.mem.Allocator.Error!void {
     if (depth >= max_sim_depth or in_notes.len == 0 or out_notes.items.len >= max_sim_notes) return;
     const rack = &parsed.midi_racks.items[ridx];
-    if (!rack.on) {
-        // Bypassed rack passes notes straight through
+    if (!rack.on or rack.branches.items.len == 0) {
         const rem = max_sim_notes - out_notes.items.len;
         try out_notes.appendSlice(a, in_notes[0..@min(in_notes.len, rem)]);
         return;
+    }
+
+    var sel_off: u8 = 0;
+    if (depth == 0 and rack.sel_offset > 0) {
+        sel_off = rack.sel_offset;
+        for (rack.branches.items) |bidx| {
+            const b = &parsed.midi_branches.items[bidx];
+            if (b.has_sel and b.sel_min < sel_off) {
+                sel_off = 0;
+                break;
+            }
+        }
     }
 
     var filtered: std.ArrayList(SimNote) = .empty;
@@ -2323,16 +3473,20 @@ fn evalRack(
         if (out_notes.items.len >= max_sim_notes) break;
         const b = &parsed.midi_branches.items[bidx];
         if (b.muted) continue;
-        // Top-level rack filters by page/chain; nested racks default to sel 0..0 (always active when !has_sel or depth > 0).
-        if (depth == 0 and b.has_sel and (chain < b.sel_min or chain > b.sel_max)) continue;
+        if (multi_selector_override) |msel| {
+            if (b.has_sel and (msel < b.sel_min or msel > b.sel_max)) continue;
+        } else if (depth == 0 and b.has_sel) {
+            const s_min = b.sel_min - sel_off;
+            const s_max = b.sel_max - sel_off;
+            if (chain < s_min or chain > s_max) continue;
+        }
 
         filtered.clearRetainingCapacity();
         for (in_notes) |sn| {
-            if (sn.note >= b.key_min and sn.note <= b.key_max) {
+            if (sn.note >= b.key_min and sn.note <= b.key_max and sn.vel >= b.vel_min and sn.vel <= b.vel_max) {
                 try filtered.append(a, sn);
             }
         }
-        // Rescue 1-branch nested wrapper racks whose stale KeyRange mismatches an inner rack explicitly keyed to the note.
         if (filtered.items.len == 0 and depth > 0 and rack.branches.items.len == 1) {
             for (in_notes) |sn| {
                 if (branchChildRackMatchesNote(parsed, b, sn.note)) {
@@ -2342,7 +3496,7 @@ fn evalRack(
         }
         if (filtered.items.len == 0) continue;
 
-        try evalDeviceChain(a, parsed, midiext, b.devs.items, beat_ms, chain, filtered.items, out_notes, depth + 1, press_idx, cycle_len);
+        try evalDeviceChain(a, parsed, midiext, hash_cache, files, layout, b.devs.items, beat_ms, chain, filtered.items, out_notes, depth + 1, press_idx, cycle_len, wormhole_out);
     }
 }
 
@@ -2350,6 +3504,9 @@ fn evalDeviceChain(
     a: std.mem.Allocator,
     parsed: *const ParsedAls,
     midiext: *MidiExtCtx,
+    hash_cache: *m4l.AmxdHashCache,
+    files: []const VirtualFile,
+    layout: NoteLayout,
     devs: []const MidiDev,
     beat_ms: f64,
     chain: u8,
@@ -2358,6 +3515,7 @@ fn evalDeviceChain(
     depth: u8,
     press_idx: usize,
     cycle_len: *usize,
+    wormhole_out: *?u8,
 ) std.mem.Allocator.Error!void {
     var cur: std.ArrayList(SimNote) = .empty;
     defer cur.deinit(a);
@@ -2366,16 +3524,21 @@ fn evalDeviceChain(
     var next: std.ArrayList(SimNote) = .empty;
     defer next.deinit(a);
 
+    var pending_multi_sel: ?u8 = null;
+
     for (devs) |dev| {
         if (cur.items.len == 0) return;
         next.clearRetainingCapacity();
 
         switch (dev) {
             .rack => |rk| {
+                const msel = pending_multi_sel;
+                pending_multi_sel = null;
                 if (!rk.on) continue;
-                try evalRack(a, parsed, midiext, rk.rack_idx, beat_ms, chain, cur.items, &next, depth, press_idx, cycle_len);
+                try evalRack(a, parsed, midiext, hash_cache, files, layout, rk.rack_idx, beat_ms, chain, cur.items, &next, depth, press_idx, cycle_len, wormhole_out, msel);
             },
             .pitcher => |p| {
+                pending_multi_sel = null;
                 if (!p.on) continue;
                 const hi: u16 = @as(u16, p.lowest) + p.range;
                 for (cur.items) |sn| {
@@ -2388,6 +3551,7 @@ fn evalDeviceChain(
                 }
             },
             .chord => |ch| {
+                pending_multi_sel = null;
                 if (!ch.on) continue;
                 for (cur.items) |sn| {
                     if (next.items.len >= max_sim_notes) break;
@@ -2399,27 +3563,24 @@ fn evalDeviceChain(
                         if (nn < 0 or nn > 127) continue;
                         if (next.items.len >= max_sim_notes) break;
                         const nv: u8 = @intFromFloat(std.math.clamp(@round(@as(f32, @floatFromInt(sn.vel)) * ch.vels[k]), 1.0, 127.0));
-                        try next.append(a, .{
-                            .start_ms = sn.start_ms,
-                            .dur_ms = sn.dur_ms,
-                            .note = @intCast(nn),
-                            .vel = nv,
-                        });
+                        var copy = sn;
+                        copy.note = @intCast(nn);
+                        copy.vel = nv;
+                        try next.append(a, copy);
                     }
                 }
             },
             .velocity => |ve| {
+                pending_multi_sel = null;
                 if (!ve.on) continue;
                 const lo: u8 = ve.lowest;
                 const hi: u8 = @intCast(@min(@as(u16, 127), @as(u16, ve.lowest) + ve.range));
-                // Live 9/10 uses Operation (0=Clip, 1=Gate, 2=Fixed); some schemas/tools use Mode (2=Fixed).
                 const is_fixed = ve.mode == 2 or ve.operation == 2;
                 const is_gate = !is_fixed and (ve.mode == 1 or ve.operation == 1);
                 for (cur.items) |sn| {
                     if (is_gate and (sn.vel < lo or sn.vel > hi)) continue;
                     var copy = sn;
                     copy.vel = if (is_fixed) ve.max_out else blk: {
-                        // Clip / Gate linear scaling [lo..hi] -> [min_out..max_out]
                         const clamped = std.math.clamp(sn.vel, lo, hi);
                         if (hi <= lo) break :blk ve.max_out;
                         const t = @as(f64, @floatFromInt(clamped - lo)) / @as(f64, @floatFromInt(hi - lo));
@@ -2430,6 +3591,7 @@ fn evalDeviceChain(
                 }
             },
             .note_length => |nl| {
+                pending_multi_sel = null;
                 if (!nl.on) continue;
                 const base_ms: f64 = if (nl.sync_state) syncedLengthBeats(nl.synced_len) * beat_ms else @floatCast(nl.time_ms);
                 const dur = @max(base_ms * (@as(f64, nl.gate) / 100.0), 1.0);
@@ -2441,13 +3603,15 @@ fn evalDeviceChain(
                 }
             },
             .arp => |ar| {
+                pending_multi_sel = null;
                 if (!ar.on) continue;
                 try evalArp(a, ar, beat_ms, cur.items, &next);
             },
             .random => |rnd| {
+                pending_multi_sel = null;
                 if (!rnd.on) continue;
                 if (rnd.alternate and rnd.chance >= 0.5 and rnd.choices > 1) {
-                    cycle_len.* = @min(@as(usize, 24), lcmUsize(cycle_len.*, rnd.choices));
+                    cycle_len.* = @min(@as(usize, 24), m4l.lcmUsize(cycle_len.*, rnd.choices));
                     const step: i32 = @intCast(press_idx % rnd.choices);
                     const shift: i32 = if (rnd.sign == 1) -step * @as(i32, rnd.scale) else step * @as(i32, rnd.scale);
                     for (cur.items) |sn| {
@@ -2463,22 +3627,172 @@ fn evalDeviceChain(
                 }
             },
             .mx_ext => |mx| {
+                pending_multi_sel = null;
                 if (!mx.on) continue;
-                if (try resolveMidiExtNotes(a, midiext, mx.lom_id)) |seq| {
-                    for (cur.items) |sn| {
-                        for (seq) |mn| {
-                            if (next.items.len >= max_sim_notes) break;
-                            try next.append(a, .{
-                                .start_ms = sn.start_ms + mn.start_ms,
-                                .dur_ms = mn.dur_ms,
-                                .note = mn.note,
-                                .vel = mn.vel,
-                            });
+                const id = m4l.identifyMxDevice(a, hash_cache, files, mx);
+                switch (id.kind) {
+                    .delay => try m4l.applyDelay(a, mx, parsed.tempo, cur.items, &next),
+                    .flip => try m4l.applyFlip(a, mx, layout, cur.items, &next),
+                    .midi_transform => try m4l.applyMidiTransform(a, mx, layout, cur.items, &next),
+                    .grid_filter => try m4l.applyGridFilter(a, mx, layout, cur.items, &next),
+                    .set_notes => try m4l.applySetNotes(a, mx, cur.items, &next),
+                    .iris => try m4l.applyIris(a, mx, parsed.tempo, cur.items, &next),
+                    .infinity => try m4l.applyInfinity(a, cur.items, &next),
+                    .resonator1, .resonator2, .resonator3, .resonator301, .resonator4 => {
+                        try m4l.applyResonator(a, id.kind, mx, layout, parsed.tempo, cur.items, &next);
+                    },
+                    .depths_selector => {
+                        const ds = m4l.parseDepthsSelector(mx);
+                        if (ds.mask_channel > 0) {
+                            if (midiext.mask_channels.get(ds.mask_channel)) |mask_seq| {
+                                // Blend color from mask channel notes overlapping shape notes on the same pad
+                                for (cur.items) |sn| {
+                                    var copy = sn;
+                                    copy.layer = ds.layer;
+                                    for (mask_seq) |mn| {
+                                        if (mn.note == sn.note and mn.vel > 0) {
+                                            copy.vel = mn.vel;
+                                            break;
+                                        }
+                                    }
+                                    try next.append(a, copy);
+                                }
+                                std.mem.swap(std.ArrayList(SimNote), &cur, &next);
+                                continue;
+                            }
                         }
-                    }
-                } else {
-                    const rem = max_sim_notes -| next.items.len;
-                    try next.appendSlice(a, cur.items[0..@min(cur.items.len, rem)]);
+                        for (cur.items) |sn| {
+                            var copy = sn;
+                            copy.layer = ds.layer;
+                            try next.append(a, copy);
+                        }
+                    },
+                    .depths_mixer, .page_switcher, .multi_reset => {
+                        const rem = max_sim_notes -| next.items.len;
+                        try next.appendSlice(a, cur.items[0..@min(cur.items.len, rem)]);
+                    },
+                    .wormhole, .wormhole_lite, .blackhole, .auto_page, .twist => {
+                        if (m4l.extractWormholeTarget(id.kind, mx)) |target| {
+                            wormhole_out.* = target;
+                        }
+                        // AutoPage / PageSwitcher pass notes through to downstream devices too
+                        if (id.kind == .auto_page) {
+                            const rem = max_sim_notes -| next.items.len;
+                            try next.appendSlice(a, cur.items[0..@min(cur.items.len, rem)]);
+                        }
+                    },
+                    .multi_outbreak, .multi_kaskobi => {
+                        if (m4l.parseMultiSettings(id.kind, mx)) |ms| {
+                            if (ms.steps > 1) {
+                                cycle_len.* = @min(@as(usize, 24), m4l.lcmUsize(cycle_len.*, ms.steps));
+                            }
+                            const step: u8 = @intCast(press_idx % @max(ms.steps, 1));
+                            if (ms.note_mode) {
+                                for (cur.items) |sn| {
+                                    const nn = @as(i32, sn.note) + @as(i32, step);
+                                    if (nn < 0 or nn > 127) continue;
+                                    var copy = sn;
+                                    copy.note = @intCast(nn);
+                                    try next.append(a, copy);
+                                }
+                            } else {
+                                pending_multi_sel = step;
+                                const rem = max_sim_notes -| next.items.len;
+                                try next.appendSlice(a, cur.items[0..@min(cur.items.len, rem)]);
+                            }
+                        } else {
+                            const rem = max_sim_notes -| next.items.len;
+                            try next.appendSlice(a, cur.items[0..@min(cur.items.len, rem)]);
+                        }
+                    },
+                    .cycle_lights => {
+                        if (m4l.resolveCycleLightsDrop(mx, press_idx, cycle_len)) |drop| {
+                            if (try resolveDropMidiNotes(a, midiext, drop, parsed.tempo, false)) |seq| {
+                                for (cur.items) |sn| {
+                                    for (seq) |mn| {
+                                        if (next.items.len >= max_sim_notes) break;
+                                        var copy = mn;
+                                        copy.start_ms += sn.start_ms;
+                                        copy.layer = sn.layer;
+                                        try next.append(a, copy);
+                                    }
+                                }
+                            }
+                        }
+                    },
+                    .midi_ext_multi_lights => {
+                        if (m4l.resolveMidiExtMultiDrop(mx, press_idx, cycle_len)) |drop| {
+                            if (try resolveDropMidiNotes(a, midiext, drop, parsed.tempo, false)) |seq| {
+                                for (cur.items) |sn| {
+                                    for (seq) |mn| {
+                                        if (next.items.len >= max_sim_notes) break;
+                                        var copy = mn;
+                                        copy.start_ms += sn.start_ms;
+                                        copy.layer = sn.layer;
+                                        try next.append(a, copy);
+                                    }
+                                }
+                            }
+                        }
+                    },
+                    .lightspeed => {
+                        for (cur.items) |sn| {
+                            const drop = m4l.resolveLightspeedDrop(mx, layout, sn.note) orelse continue;
+                            const seq = (try resolveDropMidiNotes(a, midiext, drop, parsed.tempo, false)) orelse continue;
+                            for (seq) |mn| {
+                                if (next.items.len >= max_sim_notes) break;
+                                var copy = mn;
+                                copy.start_ms += sn.start_ms;
+                                copy.layer = sn.layer;
+                                try next.append(a, copy);
+                            }
+                        }
+                    },
+                    .midi_launcher, .midi_launcher_pro => {
+                        const ls = m4l.parseMidiLauncherSettings(id.kind, id, mx, parsed.tempo);
+                        const eff_tempo = ls.tempo_override orelse parsed.tempo;
+                        if (mx.drops.len > 0) {
+                            if (try resolveDropMidiNotes(a, midiext, mx.drops[0], eff_tempo, ls.skip_silence)) |seq| {
+                                for (cur.items) |sn| {
+                                    for (seq) |mn| {
+                                        if (next.items.len >= max_sim_notes) break;
+                                        if (m4l.transformLauncherNote(mn, ls, layout, sn.note)) |tn| {
+                                            var copy = tn;
+                                            copy.start_ms += sn.start_ms;
+                                            copy.layer = sn.layer;
+                                            try next.append(a, copy);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    },
+                    .midi_ext, .midi_fire, .unknown => {
+                        const ext_settings = m4l.parseGenericMidiExtSettings(mx);
+                        if (ext_settings.is_mask) {
+                            // Mask-mode MIDIext feeds DepthsMixer channel, does not directly emit LEDs
+                            continue;
+                        }
+                        if (try resolveMidiExtNotes(a, midiext, mx, parsed.tempo)) |seq| {
+                            for (cur.items) |sn| {
+                                for (seq) |mn| {
+                                    if (next.items.len >= max_sim_notes) break;
+                                    var copy = mn;
+                                    copy.start_ms += sn.start_ms;
+                                    copy.layer = sn.layer;
+                                    if (ext_settings.loop) copy.loop = true;
+                                    try next.append(a, copy);
+                                }
+                            }
+                        } else {
+                            const rem = max_sim_notes -| next.items.len;
+                            try next.appendSlice(a, cur.items[0..@min(cur.items.len, rem)]);
+                        }
+                    },
+                    else => {
+                        const rem = max_sim_notes -| next.items.len;
+                        try next.appendSlice(a, cur.items[0..@min(cur.items.len, rem)]);
+                    },
                 }
             },
         }
@@ -2592,12 +3906,106 @@ fn evalArp(
                     plen += 1;
                 }
             },
+            6, 8 => { // Converge (6) / Con & Div (8)
+                var lo: usize = 0;
+                var hi: usize = ulen;
+                while (lo < hi) {
+                    pat[plen] = uniq[lo];
+                    plen += 1;
+                    lo += 1;
+                    if (lo < hi) {
+                        hi -= 1;
+                        pat[plen] = uniq[hi];
+                        plen += 1;
+                    }
+                }
+                if (ar.mode == 8 and plen > 2) {
+                    var k: usize = plen - 1;
+                    while (k > 1) : (k -= 1) {
+                        pat[plen] = pat[k - 1];
+                        plen += 1;
+                    }
+                }
+            },
+            7, 9 => { // Diverge (7) / Div & Con (9)
+                var lo: usize = 0;
+                var hi: usize = ulen;
+                var tmp: [128]SimNote = undefined;
+                var tlen: usize = 0;
+                while (lo < hi) {
+                    tmp[tlen] = uniq[lo];
+                    tlen += 1;
+                    lo += 1;
+                    if (lo < hi) {
+                        hi -= 1;
+                        tmp[tlen] = uniq[hi];
+                        tlen += 1;
+                    }
+                }
+                var k: usize = tlen;
+                while (k > 0) : (k -= 1) {
+                    pat[plen] = tmp[k - 1];
+                    plen += 1;
+                }
+                if (ar.mode == 9 and plen > 2) {
+                    var m: usize = plen - 1;
+                    while (m > 1) : (m -= 1) {
+                        pat[plen] = pat[m - 1];
+                        plen += 1;
+                    }
+                }
+            },
+            10, 11 => { // Pinky Up (10) / Pinky UpDown (11)
+                if (ulen == 1) {
+                    pat[0] = uniq[0];
+                    plen = 1;
+                } else {
+                    for (0..ulen - 1) |k| {
+                        pat[plen] = uniq[k];
+                        plen += 1;
+                        pat[plen] = uniq[ulen - 1];
+                        plen += 1;
+                    }
+                    if (ar.mode == 11 and ulen > 2) {
+                        var k: usize = ulen - 2;
+                        while (k > 0) : (k -= 1) {
+                            pat[plen] = uniq[k];
+                            plen += 1;
+                            pat[plen] = uniq[ulen - 1];
+                            plen += 1;
+                        }
+                    }
+                }
+            },
+            12, 13 => { // Thumb Up (12) / Thumb UpDown (13)
+                if (ulen == 1) {
+                    pat[0] = uniq[0];
+                    plen = 1;
+                } else {
+                    for (1..ulen) |k| {
+                        pat[plen] = uniq[0];
+                        plen += 1;
+                        pat[plen] = uniq[k];
+                        plen += 1;
+                    }
+                    if (ar.mode == 13 and ulen > 2) {
+                        var k: usize = ulen - 1;
+                        while (k > 1) : (k -= 1) {
+                            pat[plen] = uniq[0];
+                            plen += 1;
+                            pat[plen] = uniq[k - 1];
+                            plen += 1;
+                        }
+                    }
+                }
+            },
             14 => { // Chord trigger: emit all simultaneously
                 for (0..reps) |r| {
                     const rt = t0 + @as(f64, @floatFromInt(r)) * step_ms;
                     for (0..ulen) |k| {
                         if (out.items.len >= max_sim_notes) break;
-                        try out.append(a, .{ .start_ms = rt, .dur_ms = note_dur, .note = uniq[k].note, .vel = uniq[k].vel });
+                        const v = arpStepVel(ar, uniq[k].vel, @as(f64, @floatFromInt(r)) * step_ms);
+                        try out.append(a, .{ .start_ms = rt, .dur_ms = note_dur, .note = uniq[k].note, .vel = v });
                     }
                 }
                 continue;
@@ -2617,11 +4025,12 @@ fn evalArp(
                 for (pat[0..plen]) |sn| {
                     const nn = @as(i32, sn.note) + shift;
                     if (nn >= 0 and nn <= 127 and out.items.len < max_sim_notes) {
+                        const dt = @as(f64, @floatFromInt(step_idx)) * step_ms;
                         try out.append(a, .{
-                            .start_ms = t0 + @as(f64, @floatFromInt(step_idx)) * step_ms,
+                            .start_ms = t0 + dt,
                             .dur_ms = note_dur,
                             .note = @intCast(nn),
-                            .vel = sn.vel,
+                            .vel = arpStepVel(ar, sn.vel, dt),
                         });
                     }
                     step_idx += 1;
@@ -2629,6 +4038,15 @@ fn evalArp(
             }
         }
     }
+}
+
+fn arpStepVel(ar: @FieldType(MidiDev, "arp"), in_vel: u8, elapsed_ms: f64) u8 {
+    if (!ar.vel_switch) return in_vel;
+    const decay: f64 = @floatCast(@max(ar.vel_decay_ms, 1.0));
+    const t = std.math.clamp(elapsed_ms / decay, 0.0, 1.0);
+    const v0: f64 = @floatFromInt(in_vel);
+    const v1: f64 = @floatFromInt(ar.vel_target);
+    return @intFromFloat(std.math.clamp(@round(v0 + (v1 - v0) * t), 0.0, 127.0));
 }
 
 fn syncedRateBeats(idx: u8) f64 {
@@ -2654,15 +4072,23 @@ fn syncedRateBeats(idx: u8) f64 {
 }
 
 fn syncedLengthBeats(idx: u8) f64 {
+    // Ableton Live MidiNoteLength SyncedLength (0=1/128 .. 14=2/1) in quarter-note beats.
     const table = [_]f64{
-        1.0 / 16.0, // 0: 1/64
-        1.0 / 8.0, // 1: 1/32
-        1.0 / 4.0, // 2: 1/16
-        1.0 / 2.0, // 3: 1/8
-        1.0, // 4: 1/4
-        2.0, // 5: 1/2
-        4.0, // 6: 1/1
-        8.0, // 7: 2/1
+        1.0 / 32.0, // 0: 1/128
+        1.0 / 16.0, // 1: 1/64
+        1.0 / 12.0, // 2: 1/48
+        1.0 / 8.0, // 3: 1/32
+        1.0 / 6.0, // 4: 1/24
+        1.0 / 4.0, // 5: 1/16
+        1.0 / 3.0, // 6: 1/12
+        1.0 / 2.0, // 7: 1/8
+        2.0 / 3.0, // 8: 1/6
+        1.0, // 9: 1/4
+        4.0 / 3.0, // 10: 1/3
+        2.0, // 11: 1/2
+        3.0, // 12: 3/4
+        4.0, // 13: 1/1
+        8.0, // 14: 2/1
     };
     return table[@min(idx, table.len - 1)];
 }
@@ -2684,15 +4110,17 @@ fn buildAutoPlay(
     layout: NoteLayout,
     chain_count: u8,
 ) ![]const AutoPlayEvent {
-    if (parsed.arr_clips.items.len == 0) return &.{};
+    const clips = if (parsed.arr_clips.items.len > 0) parsed.arr_clips.items else parsed.fallback_clips.items;
+    if (clips.len == 0) return &.{};
     const beat_ms = 60000.0 / std.math.clamp(parsed.tempo, 20.0, 400.0);
 
     var raw_acts: std.ArrayList(AutoAction) = .empty;
     defer raw_acts.deinit(a);
 
     var min_t: u32 = std.math.maxInt(u32);
+    var max_t: u32 = 0;
 
-    for (parsed.arr_clips.items) |clip| {
+    for (clips) |clip| {
         if (clip.end_beat <= clip.start_beat) continue;
         const clip_len = clip.end_beat - clip.start_beat;
         const clip_chain = parseClipChain(clip.name, chain_count);
@@ -2710,6 +4138,7 @@ fn buildAutoPlay(
                 added_note = true;
                 if (t_on < clip_first_t) clip_first_t = t_on;
                 if (t_on < min_t) min_t = t_on;
+                if (t_off > max_t) max_t = t_off;
                 try raw_acts.append(a, .{ .t_ms = t_on, .kind = .on, .a = xy[0], .b = xy[1] });
                 try raw_acts.append(a, .{ .t_ms = t_off, .kind = .off, .a = xy[0], .b = xy[1] });
             } else if (n.midi_key >= 100 and n.midi_key <= 107) {
@@ -2728,6 +4157,25 @@ fn buildAutoPlay(
     }
 
     if (raw_acts.items.len == 0 or min_t == std.math.maxInt(u32)) return &.{};
+
+    // Merge ChainSelector / MacroControls.0 ArrangerAutomation page switches (AbletonTutorialDetector)
+    if (parsed.page_auto_targets.items.len > 0) {
+        for (parsed.raw_auto_events.items) |re| {
+            for (parsed.page_auto_targets.items) |pt| {
+                if (pt.id == re.pointee_id) {
+                    const raw_ch: i32 = @intFromFloat(@round(re.val));
+                    const norm_ch: i32 = raw_ch - @as(i32, pt.sel_offset);
+                    if (norm_ch >= 0 and norm_ch < chain_count) {
+                        const t_ms: u32 = @intFromFloat(std.math.clamp(@round(re.beat * beat_ms), 0.0, 3600000.0));
+                        if (t_ms <= max_t) {
+                            try raw_acts.append(a, .{ .t_ms = @max(t_ms, min_t), .kind = .chain, .a = @intCast(norm_ch), .b = 0 });
+                        }
+                    }
+                    break;
+                }
+            }
+        }
+    }
 
     std.mem.sort(AutoAction, raw_acts.items, {}, struct {
         fn lt(_: void, x: AutoAction, y: AutoAction) bool {
@@ -2795,42 +4243,6 @@ fn detectLayout(samples: []const PadMapping) NoteLayout {
     }
     if (user1_only == 0 and prog_only > 0) return .programmer;
     return .user1;
-}
-
-/// Converts Ableton MIDI note to 0-based UniPack (row, col) with row 0 = top, col 0 = left.
-pub fn midiNoteToXY(layout: NoteLayout, note: u8) ?[2]u8 {
-    switch (layout) {
-        .user1 => {
-            if (note < 36 or note > 99) return null;
-            const rel = note - 36;
-            const half: u8 = rel / 32; // 0 = left 4 cols, 1 = right 4 cols
-            const sub = rel % 32;
-            const row_from_bottom = sub / 4; // 0..7
-            const col_in_half = sub % 4; // 0..3
-            return .{ 7 - row_from_bottom, half * 4 + col_in_half };
-        },
-        .programmer => {
-            if (note < 11 or note > 88) return null;
-            const r = note / 10;
-            const col = note % 10;
-            if (r < 1 or r > 8 or col < 1 or col > 8) return null;
-            return .{ 8 - r, col - 1 };
-        },
-    }
-}
-
-pub fn xyToMidiNote(layout: NoteLayout, row: u8, col: u8) u8 {
-    switch (layout) {
-        .user1 => {
-            const half: u8 = col / 4;
-            const col_in_half: u8 = col % 4;
-            const row_from_bottom: u8 = 7 - row;
-            return 36 + half * 32 + row_from_bottom * 4 + col_in_half;
-        },
-        .programmer => {
-            return (8 - row) * 10 + (col + 1);
-        },
-    }
 }
 
 /// Maps outer ring LEDs (Top 0..7, Right 8..15, Bottom 16..23, Left 24..31, Logo 32)
@@ -2975,42 +4387,145 @@ fn shouldTrimSample(pm: PadMapping, vf: VirtualFile) bool {
     return false;
 }
 
-fn trimSampleFile(
+fn effectiveVolumeGain(vol_db: f32) f32 {
+    // Live's default Simpler volume is -12 dB; only scale when explicitly attenuated below -15 dB or boosted above +1 dB.
+    if (vol_db < -15.0) {
+        return @floatCast(std.math.pow(f64, 10.0, @as(f64, vol_db + 12.0) / 20.0));
+    }
+    if (vol_db > 1.0) {
+        return @floatCast(std.math.pow(f64, 10.0, @as(f64, vol_db) / 20.0));
+    }
+    return 1.0;
+}
+
+fn shouldProcessSample(pm: PadMapping, vf: VirtualFile) bool {
+    if (shouldTrimSample(pm, vf)) return true;
+    if (pm.transpose_semitones != 0) return true;
+    if (pm.fade_in_ms > 0.5 or pm.fade_out_ms > 0.5) return true;
+    if (pm.volume_db < -15.0 or pm.volume_db > 1.0) return true;
+    return false;
+}
+
+/// Applies transpose (linear-interp pitch resample), fade-in/out, and gain to stereo f32 PCM -> 16-bit WAV.
+fn renderStereoPcmFx(
+    a: std.mem.Allocator,
+    stereo_f32: []const f32,
+    sr: u32,
+    transpose_semitones: i8,
+    fade_in_ms: f32,
+    fade_out_ms: f32,
+    gain: f32,
+) ![]u8 {
+    const in_frames = stereo_f32.len / 2;
+    if (in_frames == 0) return try encodeStereoPcm16Wav(a, &.{}, sr);
+
+    const pitch_ratio: f64 = if (transpose_semitones != 0)
+        std.math.pow(f64, 2.0, @as(f64, @floatFromInt(transpose_semitones)) / 12.0)
+    else
+        1.0;
+    const out_frames_raw: usize = @intFromFloat(@max(1.0, @round(@as(f64, @floatFromInt(in_frames)) / pitch_ratio)));
+    const out_frames = @min(out_frames_raw, 48000 * 120); // cap 2 min per pad
+
+    const buf = try a.alloc(f32, out_frames * 2);
+    defer a.free(buf);
+
+    const fade_in_frames: usize = @min(out_frames, @as(usize, @intFromFloat(@max(0.0, @as(f64, fade_in_ms) * @as(f64, @floatFromInt(sr)) / 1000.0))));
+    const fade_out_frames: usize = @min(out_frames, @as(usize, @intFromFloat(@max(0.0, @as(f64, fade_out_ms) * @as(f64, @floatFromInt(sr)) / 1000.0))));
+
+    for (0..out_frames) |i| {
+        var env: f32 = gain;
+        if (fade_in_frames > 0 and i < fade_in_frames) {
+            env *= @as(f32, @floatFromInt(i)) / @as(f32, @floatFromInt(fade_in_frames));
+        }
+        if (fade_out_frames > 0 and i >= out_frames - fade_out_frames) {
+            const rem = out_frames - i;
+            env *= @as(f32, @floatFromInt(rem)) / @as(f32, @floatFromInt(fade_out_frames));
+        }
+
+        if (transpose_semitones == 0) {
+            buf[i * 2] = stereo_f32[i * 2] * env;
+            buf[i * 2 + 1] = stereo_f32[i * 2 + 1] * env;
+        } else {
+            const src_pos = @as(f64, @floatFromInt(i)) * pitch_ratio;
+            const idx0: usize = @min(@as(usize, @intFromFloat(@floor(src_pos))), in_frames - 1);
+            const idx1: usize = @min(idx0 + 1, in_frames - 1);
+            const frac: f32 = @floatCast(src_pos - @floor(src_pos));
+            const l = stereo_f32[idx0 * 2] * (1.0 - frac) + stereo_f32[idx1 * 2] * frac;
+            const r = stereo_f32[idx0 * 2 + 1] * (1.0 - frac) + stereo_f32[idx1 * 2 + 1] * frac;
+            buf[i * 2] = l * env;
+            buf[i * 2 + 1] = r * env;
+        }
+    }
+    return try encodeStereoPcm16Wav(a, buf, sr);
+}
+
+fn processSampleFile(
     a: std.mem.Allocator,
     vf: VirtualFile,
-    start_frame: u64,
-    end_frame: u64,
-    default_sr: u32,
+    low_path: []const u8,
+    pm: PadMapping,
+    decoded_cache: anytype,
 ) !?VirtualFile {
+    const gain = effectiveVolumeGain(pm.volume_db);
+    const has_dsp = pm.transpose_semitones != 0 or pm.fade_in_ms > 0.5 or pm.fade_out_ms > 0.5 or @abs(gain - 1.0) > 0.01;
+    const start_frame = pm.sample_start;
+    const end_frame = pm.sample_end;
+
     if (endsWithIgnoreCase(vf.rel_path, ".wav")) {
-        if (try trimWavBytes(a, vf.bytes, start_frame, end_frame)) |out| {
-            return .{ .rel_path = vf.rel_path, .bytes = out };
+        if (!has_dsp) {
+            if (try trimWavBytes(a, vf.bytes, start_frame, end_frame)) |out| {
+                return .{ .rel_path = vf.rel_path, .bytes = out };
+            }
+            return null;
         }
-        return null;
+        const w = parseWav(vf.bytes) orelse return null;
+        if (w.total_frames == 0) return null;
+        const s: usize = @intCast(@min(start_frame, w.total_frames));
+        const e: usize = @intCast(if (end_frame > start_frame) @min(end_frame, w.total_frames) else w.total_frames);
+        if (e <= s) return null;
+        const n_frames = e - s;
+        const stereo = try a.alloc(f32, n_frames * 2);
+        defer a.free(stereo);
+        for (0..n_frames) |f| {
+            stereo[f * 2] = readWavSampleF32(w, s + f, 0);
+            stereo[f * 2 + 1] = readWavSampleF32(w, s + f, if (w.channels > 1) 1 else 0);
+        }
+        const wav_bytes = try renderStereoPcmFx(a, stereo, w.sample_rate, pm.transpose_semitones, pm.fade_in_ms, pm.fade_out_ms, gain);
+        const stem = stemOfPath(vf.rel_path);
+        const new_name = try std.fmt.allocPrint(a, "{s}_fx.wav", .{stem});
+        return .{ .rel_path = new_name, .bytes = wav_bytes };
     }
 
-    // Desktop: sample-accurate decode + slice -> 16-bit stereo PCM WAV for non-WAV formats (.mp3/.ogg/.flac/.aif)
+    // Desktop: sample-accurate decode + slice + DSP -> 16-bit stereo PCM WAV for non-WAV formats
     if (!is_wasm) {
-        const sr: u32 = if (default_sr >= 8000 and default_sr <= 192000) default_sr else 44100;
-        if (decode.decode(a, vf.bytes, vf.rel_path, sr)) |samp| {
-            defer a.free(samp.data);
+        const sr: u32 = if (pm.default_sample_rate >= 8000 and pm.default_sample_rate <= 192000) pm.default_sample_rate else 44100;
+        const dkey = try std.fmt.allocPrint(a, "{s}@{d}", .{ low_path, sr });
+        const samp_opt: ?decode.Sample = if (decoded_cache.get(dkey)) |cached| cached else blk: {
+            const dec = decode.decode(a, vf.bytes, vf.rel_path, sr) catch break :blk null;
+            try decoded_cache.put(a, dkey, dec);
+            break :blk dec;
+        };
+        if (samp_opt) |samp| {
             const total_frames: u64 = samp.data.len / 2;
             if (total_frames > 0) {
                 const s = @min(start_frame, total_frames);
                 const e = if (end_frame > s) @min(end_frame, total_frames) else total_frames;
-                if (e > s and (s > 0 or e + 64 < total_frames)) {
+                if (e > s and (has_dsp or s > 0 or e + 64 < total_frames)) {
                     const pcm_slice = samp.data[@intCast(s * 2)..@intCast(e * 2)];
-                    const wav_bytes = try encodeStereoPcm16Wav(a, pcm_slice, sr);
+                    const wav_bytes = if (has_dsp)
+                        try renderStereoPcmFx(a, pcm_slice, sr, pm.transpose_semitones, pm.fade_in_ms, pm.fade_out_ms, gain)
+                    else
+                        try encodeStereoPcm16Wav(a, pcm_slice, sr);
                     const stem = stemOfPath(vf.rel_path);
                     const new_name = try std.fmt.allocPrint(a, "{s}_trim.wav", .{stem});
                     return .{ .rel_path = new_name, .bytes = wav_bytes };
                 }
             }
-        } else |_| {}
+        }
     }
 
     // WASM (or fallback): pure-Zig MPEG frame-boundary trimmer for MP3
-    if (endsWithIgnoreCase(vf.rel_path, ".mp3")) {
+    if (endsWithIgnoreCase(vf.rel_path, ".mp3") and shouldTrimSample(pm, vf)) {
         if (try trimMp3Bytes(a, vf.bytes, start_frame, end_frame)) |out| {
             return .{ .rel_path = vf.rel_path, .bytes = out };
         }
@@ -3429,8 +4944,8 @@ test "ableton streaming parser and lightshow simulator convert synthetic als" {
     try std.testing.expectEqual(@as(usize, 1), proj.sound_cells[cell].len);
     // Chord(+1) + Arp(2 steps) -> 2 pads lit with velocity 45 -> at least 4 events (on, delay, off/on, delay, off)
     try std.testing.expectEqual(@as(usize, 1), proj.led_cells[cell].len);
-    try std.testing.expect(proj.led_cells[cell][0].len >= 4);
-    try std.testing.expectEqual(@as(u8, 45), proj.led_cells[cell][0][0].pad_on.velocity);
+    try std.testing.expect(proj.led_cells[cell][0].events.len >= 4);
+    try std.testing.expectEqual(@as(u8, 45), proj.led_cells[cell][0].events[0].pad_on.velocity);
     // Arrangement clip -> AutoPlay has chain + on + delay + off
     try std.testing.expect(proj.auto_play.len >= 3);
 
@@ -3595,7 +5110,7 @@ test "ableton keytrack backfill, heart wrapper+velocity scaling, outer inst rack
     // Heart LED wrapper rescue + linear MidiVelocity + Glowing track breathing pulse:
     // pad 51 (4,3) emits vel 5 (red), vel 3 (white), and dimmed pulse color frames over 2000ms
     try std.testing.expectEqual(@as(usize, 1), proj.led_cells[4 * 8 + 3].len);
-    const heart_evs = proj.led_cells[4 * 8 + 3][0];
+    const heart_evs = proj.led_cells[4 * 8 + 3][0].events;
     var saw_red = false;
     var saw_white = false;
     var saw_dimmed_pulse = false;
@@ -3612,14 +5127,14 @@ test "ableton keytrack backfill, heart wrapper+velocity scaling, outer inst rack
     // press 1 -> 1-1.mid note 40 (6,0) vel 21; press 2 -> shifted note 37 (7,1) vel 55
     const mx_anims = proj.led_cells[7 * 8 + 0];
     try std.testing.expectEqual(@as(usize, 2), mx_anims.len);
-    try std.testing.expect(mx_anims[0].len >= 3);
-    try std.testing.expectEqual(@as(u8, 6), mx_anims[0][0].pad_on.row);
-    try std.testing.expectEqual(@as(u8, 0), mx_anims[0][0].pad_on.col);
-    try std.testing.expectEqual(@as(u8, 21), mx_anims[0][0].pad_on.velocity);
-    try std.testing.expect(mx_anims[1].len >= 3);
-    try std.testing.expectEqual(@as(u8, 7), mx_anims[1][0].pad_on.row);
-    try std.testing.expectEqual(@as(u8, 1), mx_anims[1][0].pad_on.col);
-    try std.testing.expectEqual(@as(u8, 55), mx_anims[1][0].pad_on.velocity);
+    try std.testing.expect(mx_anims[0].events.len >= 3);
+    try std.testing.expectEqual(@as(u8, 6), mx_anims[0].events[0].pad_on.row);
+    try std.testing.expectEqual(@as(u8, 0), mx_anims[0].events[0].pad_on.col);
+    try std.testing.expectEqual(@as(u8, 21), mx_anims[0].events[0].pad_on.velocity);
+    try std.testing.expect(mx_anims[1].events.len >= 3);
+    try std.testing.expectEqual(@as(u8, 7), mx_anims[1].events[0].pad_on.row);
+    try std.testing.expectEqual(@as(u8, 1), mx_anims[1].events[0].pad_on.col);
+    try std.testing.expectEqual(@as(u8, 55), mx_anims[1].events[0].pad_on.velocity);
 }
 
 test "ableton live 9 legacy launchpad S colors, simpler trim, layer mix, and pure-zig zip" {
@@ -3708,7 +5223,7 @@ test "ableton live 9 legacy launchpad S colors, simpler trim, layer mix, and pur
 
     // Launchpad S velocity 75 (0x4B -> R=3,G=0) converted to RGB velocity 5 (Bright Red)
     try std.testing.expectEqual(@as(usize, 1), proj.led_cells[7 * 8 + 0].len);
-    try std.testing.expectEqual(@as(u8, 5), proj.led_cells[7 * 8 + 0][0][0].pad_on.velocity);
+    try std.testing.expectEqual(@as(u8, 5), proj.led_cells[7 * 8 + 0][0].events[0].pad_on.velocity);
 
     // Pure-Zig ZIP buffer export
     const res = try convertFilesToUniPackZipBuffer(std.testing.allocator, &files, "Fallback");
@@ -3759,4 +5274,302 @@ test "ableton live 9 legacy launchpad S colors, simpler trim, layer mix, and pur
     // Placed in chain 1 (outer sel 1..1 preserved despite inner sel 0..0) as 2 separate sequential entries
     try std.testing.expectEqual(@as(usize, 0), seq_proj.sound_cells[7 * 8 + 0].len);
     try std.testing.expectEqual(@as(usize, 2), seq_proj.sound_cells[64 + 7 * 8 + 0].len);
+}
+
+test "ableton live 8 automation params, empty rack passthrough, non-live track filter, and FileDropList midi" {
+    try std.testing.expectApproxEqAbs(@as(f64, 0.25), syncedLengthBeats(5), 1e-6); // 1/16
+    try std.testing.expectApproxEqAbs(@as(f64, 1.0), syncedLengthBeats(9), 1e-6); // 1/4
+
+    const mini_mid = [_]u8{
+        'M', 'T', 'h', 'd', 0, 0, 0, 6, 0, 0, 0, 1, 0x01, 0xE0,
+        'M', 'T', 'r', 'k', 0, 0, 0, 13,
+        0x00, 0x90, 41, 45,
+        0x81, 0x70, 0x80, 41, 0,
+        0x00, 0xFF, 0x2F, 0x00,
+    };
+
+    const als8 =
+        \\<Ableton MajorVersion="4" MinorVersion="8.1_226" Creator="Ableton Live 8.2.5">
+        \\  <LiveSet>
+        \\    <MasterTrack><DeviceChain><Mixer><Tempo>
+        \\      <ArrangerAutomation><Events><FloatEvent Time="-63072000" Value="150" /></Events></ArrangerAutomation>
+        \\    </Tempo></Mixer></DeviceChain></MasterTrack>
+        \\    <Tracks>
+        \\      <MidiTrack>
+        \\        <DeviceChain>
+        \\          <MainSequencer><Recorder><IsArmed Value="false" /></Recorder><MonitoringEnum Value="0" /></MainSequencer>
+        \\          <MidiOutputRouting><Target Value="MidiOut/External.Dev:4- Launchpad/0" /></MidiOutputRouting>
+        \\          <DeviceChain><Devices>
+        \\            <MidiEffectGroupDevice><Branches>
+        \\              <MidiEffectBranch>
+        \\                <DeviceChain><MidiToMidiDeviceChain><Devices>
+        \\                  <MidiEffectGroupDevice><Branches /></MidiEffectGroupDevice>
+        \\                  <MidiVelocity>
+        \\                    <On><ArrangerAutomation><Events><BoolEvent Time="-63072000" Value="true" /></Events></ArrangerAutomation></On>
+        \\                    <Operation><ArrangerAutomation><Events><EnumEvent Time="-63072000" Value="2" /></Events></ArrangerAutomation></Operation>
+        \\                    <MaxOut><ArrangerAutomation><Events><FloatEvent Time="-63072000" Value="75" /></Events></ArrangerAutomation></MaxOut>
+        \\                  </MidiVelocity>
+        \\                </Devices></MidiToMidiDeviceChain></DeviceChain>
+        \\                <BranchSelectorRange><Min Value="0" /><Max Value="0" /></BranchSelectorRange>
+        \\                <ZoneSettings><KeyRange><Min Value="36" /><Max Value="36" /></KeyRange></ZoneSettings>
+        \\              </MidiEffectBranch>
+        \\              <MidiEffectBranch>
+        \\                <DeviceChain><MidiToMidiDeviceChain><Devices>
+        \\                  <MxDeviceMidiEffect>
+        \\                    <FileDropList><FileRef><Name Value="drop.mid" /></FileRef></FileDropList>
+        \\                  </MxDeviceMidiEffect>
+        \\                </Devices></MidiToMidiDeviceChain></DeviceChain>
+        \\                <BranchSelectorRange><Min Value="0" /><Max Value="0" /></BranchSelectorRange>
+        \\                <ZoneSettings><KeyRange><Min Value="37" /><Max Value="37" /></KeyRange></ZoneSettings>
+        \\              </MidiEffectBranch>
+        \\            </Branches></MidiEffectGroupDevice>
+        \\          </Devices></DeviceChain>
+        \\        </DeviceChain>
+        \\      </MidiTrack>
+        \\      <MidiTrack>
+        \\        <DeviceChain>
+        \\          <MainSequencer><Recorder><IsArmed Value="false" /></Recorder><MonitoringEnum Value="1" /></MainSequencer>
+        \\          <MidiOutputRouting><Target Value="MidiOut/External.Dev:4- Launchpad/0" /></MidiOutputRouting>
+        \\          <DeviceChain><Devices>
+        \\            <MidiEffectGroupDevice><Branches>
+        \\              <MidiEffectBranch>
+        \\                <BranchSelectorRange><Min Value="0" /><Max Value="0" /></BranchSelectorRange>
+        \\                <ZoneSettings><KeyRange><Min Value="0" /><Max Value="127" /></KeyRange></ZoneSettings>
+        \\              </MidiEffectBranch>
+        \\            </Branches></MidiEffectGroupDevice>
+        \\          </Devices></DeviceChain>
+        \\        </DeviceChain>
+        \\      </MidiTrack>
+        \\    </Tracks>
+        \\  </LiveSet>
+        \\</Ableton>
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const files = [_]VirtualFile{
+        .{ .rel_path = "Live8.als", .bytes = als8 },
+        .{ .rel_path = "MIDI/drop.mid", .bytes = &mini_mid },
+    };
+
+    const proj = try buildProject(a, &files, "Live8");
+    // Pad 36 (7,0): passed through empty 0-branch rack, Live 8 MaxOut=75 (LP S Red) -> RGB vel 5
+    try std.testing.expectEqual(@as(usize, 1), proj.led_cells[7 * 8 + 0].len);
+    try std.testing.expectEqual(@as(u8, 5), proj.led_cells[7 * 8 + 0][0].events[0].pad_on.velocity);
+    // Pad 37 (7,1): FileDropList drop.mid note 41 (6,1), LP S vel 45 (R=1,G=2 -> RGB 18)
+    try std.testing.expectEqual(@as(usize, 1), proj.led_cells[7 * 8 + 1].len);
+    try std.testing.expectEqual(@as(u8, 6), proj.led_cells[7 * 8 + 1][0].events[0].pad_on.row);
+    try std.testing.expectEqual(@as(u8, 1), proj.led_cells[7 * 8 + 1][0].events[0].pad_on.col);
+    // Unarmed Auto-monitor Tutorial track skipped: pad 38 (7,2) has 0 LEDs
+    try std.testing.expectEqual(@as(usize, 0), proj.led_cells[7 * 8 + 2].len);
+}
+
+test "amethyst m4l full pipeline: wormhole, flip, iris, resonator, macro mapping, simpler transpose/fade, custom palette, page automation" {
+    _ = m4l;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Synthesize a 441-frame 44.1kHz stereo 16-bit WAV (10ms)
+    var pcm: [441 * 2]f32 = undefined;
+    for (0..441) |i| {
+        pcm[i * 2] = 0.5;
+        pcm[i * 2 + 1] = 0.5;
+    }
+    const wav_bytes = try encodeStereoPcm16Wav(a, &pcm, 44100);
+
+    // Helper hex blobs:
+    // WormholeLite page 2: {"live.numbox":[2]} -> 7b226c6976652e6e756d626f78223a5b325d7d
+    // Flip horizontal: {"number":[1],"umenu":[0],"pictctrl":[0]} -> 7b226e756d626572223a5b315d2c22756d656e75223a5b305d2c22706963746374726c223a5b305d7d
+    // Iris 2 colors looping: {"live.text[1]":[1],"Rate[2]":[50],"live.text":[1],"table":[1,2]} -> 7b226c6976652e746578745b315d223a5b315d2c22526174655b325d223a5b35305d2c226c6976652e74657874223a5b315d2c227461626c65223a5b312c325d7d
+    const als =
+        \\<Ableton MajorVersion="5">
+        \\  <LiveSet>
+        \\    <MasterTrack><DeviceChain><Mixer><Tempo><Manual Value="120" /></Tempo></Mixer></DeviceChain></MasterTrack>
+        \\    <Tracks>
+        \\      <MidiTrack>
+        \\        <AutomationEnvelopes><Envelopes>
+        \\          <AutomationEnvelope>
+        \\            <EnvelopeTarget><PointeeId Value="777" /></EnvelopeTarget>
+        \\            <Automation><Events>
+        \\              <FloatEvent Time="0" Value="0" />
+        \\              <FloatEvent Time="2" Value="1" />
+        \\            </Events></Automation>
+        \\          </AutomationEnvelope>
+        \\        </Envelopes></AutomationEnvelopes>
+        \\        <DeviceChain>
+        \\          <MainSequencer><ClipTimeable><ArrangerAutomation><Events>
+        \\            <MidiClip Time="0"><Name Value="Tutorial" /><CurrentStart Value="0" /><CurrentEnd Value="4" />
+        \\              <Loop><LoopStart Value="0" /></Loop>
+        \\              <Notes><KeyTracks><KeyTrack>
+        \\                <Notes>
+        \\                  <MidiNoteEvent Time="0" Duration="0.5" IsEnabled="true" />
+        \\                  <MidiNoteEvent Time="2" Duration="0.5" IsEnabled="true" />
+        \\                </Notes>
+        \\                <MidiKey Value="36" />
+        \\              </KeyTrack></KeyTracks></Notes>
+        \\            </MidiClip>
+        \\          </Events></ArrangerAutomation></ClipTimeable></MainSequencer>
+        \\          <DeviceChain><Devices>
+        \\            <InstrumentGroupDevice>
+        \\              <ChainSelector><AutomationTarget Id="777" /></ChainSelector>
+        \\              <Branches>
+        \\                <InstrumentBranch>
+        \\                  <BranchSelectorRange><Min Value="0" /><Max Value="0" /></BranchSelectorRange>
+        \\                  <DeviceChain><Devices>
+        \\                    <DrumGroupDevice><Branches>
+        \\                      <DrumBranch>
+        \\                        <BranchInfo><ReceivingNote Value="92" /></BranchInfo>
+        \\                        <DeviceChain><Devices>
+        \\                          <MxDeviceMidiEffect>
+        \\                            <On><Manual Value="true" /></On>
+        \\                            <PatchSlot><Value><MxDPatchRef><FileRef><Name Value="Wormhole Lite.amxd" /></FileRef></MxDPatchRef></Value></PatchSlot>
+        \\                            <BlobSlot><Value><MxDBlob><Blob>7b226c6976652e6e756d626f78223a5b325d7d</Blob></MxDBlob></Value></BlobSlot>
+        \\                          </MxDeviceMidiEffect>
+        \\                          <OriginalSimpler>
+        \\                            <On><Manual Value="true" /></On>
+        \\                            <Pitch><TransposeKey><Manual Value="12" /></TransposeKey></Pitch>
+        \\                            <VolumeAndPan>
+        \\                              <Volume><Manual Value="0" /></Volume>
+        \\                              <OneShotEnvelope>
+        \\                                <FadeInTime><Manual Value="2" /></FadeInTime>
+        \\                                <FadeOutTime><Manual Value="2" /></FadeOutTime>
+        \\                              </OneShotEnvelope>
+        \\                            </VolumeAndPan>
+        \\                            <Player><MultiSampleMap><SampleParts><MultiSamplePart>
+        \\                              <SampleRef><FileRef><Name Value="kick.wav" /></FileRef></SampleRef>
+        \\                            </MultiSamplePart></SampleParts></MultiSampleMap></Player>
+        \\                          </OriginalSimpler>
+        \\                        </Devices></DeviceChain>
+        \\                      </DrumBranch>
+        \\                    </Branches></DrumGroupDevice>
+        \\                  </Devices></DeviceChain>
+        \\                </InstrumentBranch>
+        \\                <InstrumentBranch>
+        \\                  <BranchSelectorRange><Min Value="1" /><Max Value="1" /></BranchSelectorRange>
+        \\                  <DeviceChain><Devices>
+        \\                    <DrumGroupDevice><Branches>
+        \\                      <DrumBranch>
+        \\                        <BranchInfo><ReceivingNote Value="92" /></BranchInfo>
+        \\                        <DeviceChain><Devices>
+        \\                          <OriginalSimpler>
+        \\                            <On><Manual Value="true" /></On>
+        \\                            <Player><MultiSampleMap><SampleParts><MultiSamplePart>
+        \\                              <SampleRef><FileRef><Name Value="kick.wav" /></FileRef></SampleRef>
+        \\                            </MultiSamplePart></SampleParts></MultiSampleMap></Player>
+        \\                          </OriginalSimpler>
+        \\                        </Devices></DeviceChain>
+        \\                      </DrumBranch>
+        \\                    </Branches></DrumGroupDevice>
+        \\                  </Devices></DeviceChain>
+        \\                </InstrumentBranch>
+        \\              </Branches>
+        \\            </InstrumentGroupDevice>
+        \\          </Devices></DeviceChain>
+        \\        </DeviceChain>
+        \\      </MidiTrack>
+        \\      <MidiTrack>
+        \\        <DeviceChain>
+        \\          <MainSequencer><Recorder><IsArmed Value="false" /></Recorder><MonitoringEnum Value="0" /></MainSequencer>
+        \\          <MidiOutputRouting><Target Value="MidiOut/External.Dev:Launchpad Pro/0" /></MidiOutputRouting>
+        \\          <DeviceChain><Devices>
+        \\            <MidiEffectGroupDevice>
+        \\              <On><Manual Value="true" /></On>
+        \\              <MacroControls.0><Manual Value="127" /></MacroControls.0>
+        \\              <Branches>
+        \\                <MidiEffectBranch>
+        \\                  <BranchSelectorRange><Min Value="0" /><Max Value="0" /></BranchSelectorRange>
+        \\                  <ZoneSettings><KeyRange><Min Value="36" /><Max Value="36" /></KeyRange></ZoneSettings>
+        \\                  <DeviceChain><MidiToMidiDeviceChain><Devices>
+        \\                    <MxDeviceMidiEffect>
+        \\                      <On><Manual Value="true" /></On>
+        \\                      <PatchSlot><Value><MxDPatchRef><FileRef><Name Value="Flip.amxd" /></FileRef></MxDPatchRef></Value></PatchSlot>
+        \\                      <BlobSlot><Value><MxDBlob><Blob>7b226e756d626572223a5b315d2c22756d656e75223a5b305d2c22706963746374726c223a5b305d7d</Blob></MxDBlob></Value></BlobSlot>
+        \\                    </MxDeviceMidiEffect>
+        \\                    <MxDeviceMidiEffect>
+        \\                      <On><Manual Value="true" /></On>
+        \\                      <PatchSlot><Value><MxDPatchRef><FileRef><Name Value="Iris.amxd" /></FileRef></MxDPatchRef></Value></PatchSlot>
+        \\                      <BlobSlot><Value><MxDBlob><Blob>7b226c6976652e746578745b315d223a5b315d2c22526174655b325d223a5b35305d2c226c6976652e74657874223a5b315d2c227461626c65223a5b312c325d7d</Blob></MxDBlob></Value></BlobSlot>
+        \\                    </MxDeviceMidiEffect>
+        \\                  </Devices></MidiToMidiDeviceChain></DeviceChain>
+        \\                </MidiEffectBranch>
+        \\                <MidiEffectBranch>
+        \\                  <BranchSelectorRange><Min Value="0" /><Max Value="0" /></BranchSelectorRange>
+        \\                  <ZoneSettings><KeyRange><Min Value="37" /><Max Value="37" /></KeyRange></ZoneSettings>
+        \\                  <DeviceChain><MidiToMidiDeviceChain><Devices>
+        \\                    <MidiVelocity>
+        \\                      <On><Manual Value="true" /></On>
+        \\                      <Operation><Manual Value="2" /></Operation>
+        \\                      <MaxOut>
+        \\                        <KeyMidi><Channel Value="16" /><NoteOrController Value="0" /></KeyMidi>
+        \\                        <MidiControllerRange><Min Value="10" /><Max Value="77" /></MidiControllerRange>
+        \\                        <Manual Value="10" />
+        \\                      </MaxOut>
+        \\                    </MidiVelocity>
+        \\                  </Devices></MidiToMidiDeviceChain></DeviceChain>
+        \\                </MidiEffectBranch>
+        \\              </Branches>
+        \\            </MidiEffectGroupDevice>
+        \\          </Devices></DeviceChain>
+        \\        </DeviceChain>
+        \\      </MidiTrack>
+        \\    </Tracks>
+        \\  </LiveSet>
+        \\</Ableton>
+    ;
+
+    const custom_pal =
+        \\0, 0 0 0;
+        \\1, 63 0 0;
+        \\2, 0 63 0;
+        \\3, 0 0 63;
+        \\4, 63 63 0;
+        \\5, 63 0 63;
+        \\6, 0 63 63;
+        \\7, 63 63 63;
+    ;
+
+    const files = [_]VirtualFile{
+        .{ .rel_path = "AmethystTest.als", .bytes = als },
+        .{ .rel_path = "Samples/kick.wav", .bytes = wav_bytes },
+        .{ .rel_path = "palette.txt", .bytes = custom_pal },
+    };
+
+    const proj = try buildProject(a, &files, "AmethystTest");
+    try std.testing.expectEqual(@as(u8, 2), proj.chain_count);
+
+    // 1. Pad 36 (7,0) Chain 0: Wormhole Lite target = chain 1 (2nd page), AND Transpose=+12 halved WAV frame count!
+    const cell0 = proj.sound_cells[7 * 8 + 0];
+    try std.testing.expectEqual(@as(usize, 1), cell0.len);
+    try std.testing.expectEqual(@as(?u8, 1), cell0[0].wormhole);
+    const fx_wav = parseWav(proj.raw_sounds[cell0[0].sample_id].bytes).?;
+    try std.testing.expect(fx_wav.total_frames >= 218 and fx_wav.total_frames <= 223);
+
+    // 2. Pad 36 (7,0) LED: Flip horizontal moved (7,0) -> (7,7); Iris looping (loop=0) + custom palette vel 1 -> 0xFFFF0000
+    const led0 = proj.led_cells[7 * 8 + 0];
+    try std.testing.expectEqual(@as(usize, 1), led0.len);
+    try std.testing.expectEqual(@as(u8, 0), led0[0].loop);
+    try std.testing.expectEqual(@as(u8, 7), led0[0].events[0].pad_on.row);
+    try std.testing.expectEqual(@as(u8, 7), led0[0].events[0].pad_on.col);
+    try std.testing.expectEqual(@as(u32, 0xFFFF0000), led0[0].events[0].pad_on.color);
+
+    // 3. Pad 37 (7,1) LED: MacroControls.0 = 127 mapped MidiVelocity MaxOut [10..77] -> 77!
+    const led1 = proj.led_cells[7 * 8 + 1];
+    try std.testing.expectEqual(@as(usize, 1), led1.len);
+    try std.testing.expectEqual(@as(u8, 77), led1[0].events[0].pad_on.velocity);
+
+    // 4. AutoPlay includes automated page switch to chain 1 at beat 2!
+    var saw_chain_1 = false;
+    for (proj.auto_play) |ev| {
+        if (ev == .chain and ev.chain == 1) saw_chain_1 = true;
+    }
+    try std.testing.expect(saw_chain_1);
+
+    // 5. Pure-Zig UniPack ZIP emission includes 6-token keySound wormhole ("1 8 1 s_0000.wav 1 2")
+    const zres = try convertFilesToUniPackZipBuffer(std.testing.allocator, &files, "AmethystTest");
+    defer std.testing.allocator.free(zres.title);
+    defer std.testing.allocator.free(zres.zip);
+    try std.testing.expect(std.mem.indexOf(u8, zres.zip, "1 8 1 s_0000.wav 1 2\n") != null);
 }

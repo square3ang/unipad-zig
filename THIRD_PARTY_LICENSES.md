@@ -33,5 +33,6 @@ All bundled and linked components are compatible with GPLv3.
 | Project | License | Use |
 | --- | --- | --- |
 | [actuon](https://github.com/square3ang/actuon) | GPLv3 | Sokol/WGSL render backend (`src/render/`), 1-period direct ALSA audio architecture, font bundling |
+| [Amethyst](https://github.com/anthonyhfm/Amethyst) | GPL-3.0 | Ableton Live Max for Live (`.amxd`) MD5 hash registry, M4L device adapters (`src/unipack/ableton_m4l.zig`), Rack Macro mapping, custom palette parsing, and AutoPlay automation detection (`src/unipack/ableton.zig`) |
 | [unipad-android](https://github.com/kimjisub/unipad-android) | LGPL-2.1 | UniPack format & playback behavior reference (clean-room Zig implementation) |
 | [web-unipad](https://github.com/square3ang/web-unipad) | — | Launchpad hardware MIDI mappings & UniPack playback reference |

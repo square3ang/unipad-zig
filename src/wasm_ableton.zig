@@ -64,7 +64,7 @@ fn isRelevantProjectFile(path: []const u8) bool {
     if (base.len == 0 or std.mem.startsWith(u8, base, "._")) return false;
     if (std.ascii.eqlIgnoreCase(base, ".ds_store")) return false;
     if (std.ascii.eqlIgnoreCase(base, "0save")) return true;
-    const exts = [_][]const u8{ ".als", ".wav", ".mp3", ".ogg", ".flac", ".aif", ".aiff", ".mid", ".midi" };
+    const exts = [_][]const u8{ ".als", ".wav", ".mp3", ".ogg", ".flac", ".aif", ".aiff", ".mid", ".midi", ".amxd", ".pal", ".txt" };
     for (exts) |ext| {
         if (path.len >= ext.len and std.ascii.eqlIgnoreCase(path[path.len - ext.len ..], ext)) return true;
     }

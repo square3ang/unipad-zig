@@ -24,9 +24,9 @@ const mLedEvents = document.getElementById('m-led-events');
 const mAuto = document.getElementById('m-auto');
 const mSize = document.getElementById('m-size');
 
-const RELEVANT_RE = /(?:^|\/)0save$|\.(?:als|wav|mp3|ogg|flac|aiff?|midi?)$/i;
+const RELEVANT_RE = /(?:^|\/)0save$|\.(?:als|wav|mp3|ogg|flac|aiff?|midi?|amxd|pal|txt)$/i;
 
-const worker = new Worker('./worker.js?v=3', { type: 'module' });
+const worker = new Worker('./worker.js?v=4', { type: 'module' });
 let busy = false;
 let lastBlobUrl = null;
 let lastFileName = 'unipack.zip';

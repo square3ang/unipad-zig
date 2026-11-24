@@ -7,7 +7,7 @@ let wasmPromise = null;
 async function loadWasm() {
   if (!wasmPromise) {
     wasmPromise = (async () => {
-      const url = new URL('./ableton-converter.wasm?v=3', self.location.href);
+      const url = new URL('./ableton-converter.wasm?v=4', self.location.href);
       try {
         const res = await fetch(url);
         if (!res.ok) throw new Error(`Failed to load WASM module (HTTP ${res.status}).`);
